@@ -1,0 +1,302 @@
+"""
+Mock implementations for testing and CI mode.
+
+These services provide deterministic, API-free behavior for:
+- Unit testing
+- CI/CD pipelines
+- Development without API keys
+- Demo environments
+
+All mocks return realistic but predictable data matching production schemas.
+"""
+
+import asyncio
+import logging
+from datetime import datetime
+from pathlib import Path
+from uuid import uuid4
+
+from ..interfaces import Transcriber, LLMExtractor
+from ..models import (
+    MeetingArtifacts,
+    UserStory,
+    Task,
+    Decision,
+    Blocker,
+    ActionItem,
+    Priority,
+    TaskStatus,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Mock Transcriber
+# =============================================================================
+
+class MockTranscriber(Transcriber):
+    """
+    Mock transcription service for testing.
+    
+    Returns a realistic hardcoded transcript instantly, simulating
+    what a real transcription might look like without any API calls.
+    """
+    
+    # Realistic sample transcript for testing
+    MOCK_TRANSCRIPT = """
+Okay everyone, let's get started with our sprint planning meeting. I'm Sarah, the product owner, 
+and we have the dev team here - Mike, Lisa, and John.
+
+So, our main focus this sprint is the user authentication feature. We've had a lot of customer 
+requests for this. As a user, I want to be able to log in with my email and password, so that 
+my data is secure and personalized.
+
+Mike, can you take the lead on this?
+
+Mike: Sure, I'll handle the backend authentication. I think we'll need about 5 story points for 
+the basic login and registration flow. I'll set up JWT tokens and the database schema.
+
+Lisa: I can work on the frontend login forms. That's probably a 3-pointer. I'll also add 
+password validation and error handling.
+
+John: I'll take the password reset flow. Users should be able to reset via email. That's about 
+3 story points as well.
+
+Sarah: Great. We also need to decide on the session timeout. I suggest 30 minutes of inactivity.
+
+Mike: That works for me. We should also implement refresh tokens.
+
+Sarah: Agreed. So that's a decision - 30 minute session timeout with refresh tokens.
+
+John: One blocker I want to raise - we still don't have the email service configured. I need 
+that for password reset emails.
+
+Sarah: Good point. Mike, can you set up the email service this week? That's blocking John's task.
+
+Mike: I'll prioritize that. Should be done by Wednesday.
+
+Lisa: Also, can we get acceptance criteria documented? I need to know the exact validation rules 
+for passwords.
+
+Sarah: Yes, acceptance criteria: minimum 8 characters, at least one uppercase, one lowercase, 
+one number, and one special character. Also, the login form needs rate limiting after 5 failed 
+attempts.
+
+Okay, any other action items? 
+
+John: I'll update the technical documentation once the authentication is in place.
+
+Sarah: Perfect. Let's wrap up. Good meeting everyone!
+""".strip()
+    
+    def __init__(self, simulated_delay: float = 0.5):
+        """
+        Initialize the mock transcriber.
+        
+        Args:
+            simulated_delay: Seconds to wait before returning (simulates processing)
+        """
+        self._delay = simulated_delay
+        logger.info("MockTranscriber initialized (TEST_MODE)")
+    
+    async def transcribe(self, audio_path: Path) -> str:
+        """
+        Return a mock transcript after a simulated delay.
+        
+        The audio_path is validated but not actually processed.
+        """
+        logger.info(f"MockTranscriber: Simulating transcription for {audio_path}")
+        
+        # Validate file exists (even in mock mode, we should check)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+        
+        # Simulate processing time
+        await asyncio.sleep(self._delay)
+        
+        logger.info("MockTranscriber: Returning mock transcript")
+        return self.MOCK_TRANSCRIPT
+    
+    async def preprocess_transcript(self, raw_transcript: str) -> str:
+        """
+        Perform basic preprocessing on the transcript.
+        Same logic as production - no mocking needed here.
+        """
+        lines = raw_transcript.strip().split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line:
+                line = ' '.join(line.split())
+                cleaned_lines.append(line)
+        
+        return '\n'.join(cleaned_lines)
+
+
+# =============================================================================
+# Mock LLM Extractor
+# =============================================================================
+
+class MockExtractor(LLMExtractor):
+    """
+    Mock LLM extraction service for testing.
+    
+    Returns deterministic, valid MeetingArtifacts that match the expected
+    schema. The data is realistic and useful for testing downstream
+    components like PDF generation.
+    """
+    
+    def __init__(self, simulated_delay: float = 0.3):
+        """
+        Initialize the mock extractor.
+        
+        Args:
+            simulated_delay: Seconds to wait before returning (simulates API call)
+        """
+        self._delay = simulated_delay
+        logger.info("MockExtractor initialized (TEST_MODE)")
+    
+    @property
+    def is_mock(self) -> bool:
+        """This is a mock implementation."""
+        return True
+    
+    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
+        """
+        Return deterministic mock artifacts matching the MeetingArtifacts schema.
+        """
+        logger.info("MockExtractor: Generating mock artifacts")
+        
+        # Simulate API processing time
+        await asyncio.sleep(self._delay)
+        
+        # Create deterministic mock data
+        artifacts = MeetingArtifacts(
+            meeting_id=uuid4(),
+            meeting_title="Sprint Planning - User Authentication Feature",
+            meeting_date=datetime.now(),
+            duration_minutes=45,
+            participants=["Sarah (Product Owner)", "Mike (Backend)", "Lisa (Frontend)", "John (Full Stack)"],
+            summary=(
+                "Sprint planning meeting focused on implementing user authentication. "
+                "The team estimated user stories for login, registration, and password reset flows. "
+                "Key decisions were made regarding session timeout and refresh tokens."
+            ),
+            user_stories=[
+                UserStory(
+                    id=uuid4(),
+                    title="User Login with Email/Password",
+                    as_a="registered user",
+                    i_want="to log in with my email and password",
+                    so_that="my data is secure and personalized",
+                    acceptance_criteria=[
+                        "Login form validates email format",
+                        "Password minimum 8 characters with complexity requirements",
+                        "Rate limiting after 5 failed attempts",
+                        "JWT token issued on successful login",
+                    ],
+                    priority=Priority.HIGH,
+                    story_points=5,
+                ),
+                UserStory(
+                    id=uuid4(),
+                    title="Password Reset via Email",
+                    as_a="user who forgot their password",
+                    i_want="to reset my password via email",
+                    so_that="I can regain access to my account",
+                    acceptance_criteria=[
+                        "User receives reset link within 5 minutes",
+                        "Reset link expires after 1 hour",
+                        "New password must meet complexity requirements",
+                    ],
+                    priority=Priority.MEDIUM,
+                    story_points=3,
+                ),
+            ],
+            tasks=[
+                Task(
+                    id=uuid4(),
+                    title="Implement Backend Authentication",
+                    description="Set up JWT tokens, database schema for users, login and registration endpoints",
+                    assignee="Mike",
+                    priority=Priority.HIGH,
+                    status=TaskStatus.TODO,
+                    due_date=None,
+                ),
+                Task(
+                    id=uuid4(),
+                    title="Create Frontend Login Forms",
+                    description="Build login and registration forms with validation and error handling",
+                    assignee="Lisa",
+                    priority=Priority.HIGH,
+                    status=TaskStatus.TODO,
+                    due_date=None,
+                ),
+                Task(
+                    id=uuid4(),
+                    title="Implement Password Reset Flow",
+                    description="Create password reset request and confirmation endpoints with email integration",
+                    assignee="John",
+                    priority=Priority.MEDIUM,
+                    status=TaskStatus.BLOCKED,
+                    due_date=None,
+                ),
+                Task(
+                    id=uuid4(),
+                    title="Configure Email Service",
+                    description="Set up email service for password reset and notification emails",
+                    assignee="Mike",
+                    priority=Priority.HIGH,
+                    status=TaskStatus.TODO,
+                    due_date="Wednesday",
+                ),
+            ],
+            decisions=[
+                Decision(
+                    id=uuid4(),
+                    title="Session Timeout Policy",
+                    description="User sessions will timeout after 30 minutes of inactivity, with refresh token support",
+                    made_by="Sarah",
+                    rationale="Balances security with user experience for typical usage patterns",
+                ),
+                Decision(
+                    id=uuid4(),
+                    title="Password Complexity Requirements",
+                    description="Passwords require minimum 8 characters, uppercase, lowercase, number, and special character",
+                    made_by="Sarah",
+                    rationale="Industry standard security requirements for user authentication",
+                ),
+            ],
+            blockers=[
+                Blocker(
+                    id=uuid4(),
+                    title="Email Service Not Configured",
+                    description="The email service is not yet set up, blocking password reset functionality",
+                    affected_tasks=["Implement Password Reset Flow"],
+                    owner="Mike",
+                    resolution_plan="Mike will configure email service by Wednesday",
+                ),
+            ],
+            action_items=[
+                ActionItem(
+                    id=uuid4(),
+                    description="Update technical documentation after authentication is implemented",
+                    assignee="John",
+                    due_date=None,
+                ),
+                ActionItem(
+                    id=uuid4(),
+                    description="Document acceptance criteria for password validation",
+                    assignee="Sarah",
+                    due_date=None,
+                ),
+            ],
+            transcript=transcript,
+        )
+        
+        logger.info(f"MockExtractor: Generated {len(artifacts.user_stories)} stories, "
+                   f"{len(artifacts.tasks)} tasks, {len(artifacts.decisions)} decisions")
+        
+        return artifacts

@@ -1,0 +1,28 @@
+# Meetolog Backend Dependencies
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Configuration
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Speech-to-Text (Local Whisper model)
+openai-whisper>=20231117
+
+# Google Gemini API
+google-generativeai>=0.3.0
+
+# PDF Generation
+reportlab>=4.0.0
+
+# Async HTTP (for external API calls if needed)
+httpx>=0.26.0
+
+# File handling
+python-multipart>=0.0.6
+aiofiles>=23.2.0
+
+# Whisper dependencies (torch is auto-installed by openai-whisper)
+# ffmpeg-python  # Optional: uncomment if you need programmatic ffmpeg access

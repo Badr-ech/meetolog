@@ -1,0 +1,60 @@
+# Ignore environment files
+.env
+.env.*
+.env.local
+.env.*.local
+
+# Ignore local AI context (do not push)
+AI_CONTEXT.md
+ai_context.md
+
+# Ignore outputs and uploads (generated files)
+outputs/
+backend/outputs/
+uploads/
+backend/uploads/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+env/
+backend/venv/
+
+# Editor/IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and coverage
+*.log
+.coverage
+htmlcov/
+
+# Database files
+*.sqlite3
+*.db
+
+# Frontend
+node_modules/
+.next/
+dist/
+build/
+
+# Misc
+*.pem
+*.key
+*.env
+
+# Keep .github (CI/workflows) in repo
+!/.github/
