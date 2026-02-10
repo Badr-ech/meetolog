@@ -1,40 +1,67 @@
 # =============================================================================
-# Meetolog Backend – Production Dockerfile
+# Meetolog Backend – Production Dockerfile (Optimized for Railway Free Tier)
 # Supports both the FastAPI web server and the ARQ background worker
 # via the SERVICE_TYPE environment variable.
+#
+# Image size optimizations:
+# - CPU-only PyTorch (no CUDA = ~3GB savings)
+# - Multi-stage build to remove build tools
+# - Aggressive cache cleanup
 # =============================================================================
 
-FROM python:3.12-slim AS base
+FROM python:3.12-slim AS builder
 
-# ---- System dependencies ----------------------------------------------------
+# Install build dependencies
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+COPY requirements.txt .
+
+# Install Python packages (CPU-only torch to save ~3GB)
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
+
+# =============================================================================
+# Final stage - minimal runtime image
+# =============================================================================
+FROM python:3.12-slim
+
+# Install only runtime dependencies
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# ---- Working directory -------------------------------------------------------
 WORKDIR /app
 
-# ---- Python dependencies (cached layer) -------------------------------------
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Copy wheels from builder and install
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/* \
+    && rm -rf /wheels \
+    && pip cache purge
 
-# ---- Application code --------------------------------------------------------
+# Copy application code
 COPY . .
 
-# ---- Directories for persistent storage -------------------------------------
-# These should be backed by a persistent volume in production.
+# Create directories for persistent storage
 RUN mkdir -p /app/uploads /app/outputs
 
-# ---- Entrypoint --------------------------------------------------------------
-COPY start.sh /app/start.sh
+# Make start script executable
 RUN chmod +x /app/start.sh
 
 # Default environment
 ENV SERVICE_TYPE=web \
-    PORT=8000
+    PORT=8000 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000
 

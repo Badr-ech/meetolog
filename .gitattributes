@@ -17,8 +17,13 @@
 # Force LF for config files
 *.yml text eol=lf
 *.yaml text eol=lf
+*.toml text eol=lf
 Dockerfile text eol=lf
+Dockerfile* text eol=lf
 *.dockerignore text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
 
 # Force LF for documentation
 *.md text eol=lf

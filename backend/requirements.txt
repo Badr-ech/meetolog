@@ -9,6 +9,10 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 
 # Speech-to-Text (Local Whisper model)
+# Install CPU-only PyTorch first (much smaller than default with CUDA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.0.0
+torchaudio>=2.0.0
 openai-whisper>=20231117
 
 # LLM Providers
