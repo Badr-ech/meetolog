@@ -4,9 +4,11 @@
 .env.local
 .env.*.local
 
-# Ignore local AI context (do not push)
-AI_CONTEXT.md
-ai_context.md
+# Markdown files
+*.md
+!README.md
+!README.txt
+!README.rst
 
 # Ignore outputs and uploads (generated files)
 outputs/

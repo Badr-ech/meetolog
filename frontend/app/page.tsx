@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { uploadAudio, pollJobStatus, getPdfDownloadUrl, JobResponse, MeetingArtifacts } from "@/lib/api";
 import styles from "./page.module.css";
 
@@ -9,6 +9,13 @@ export default function Home() {
   const [isUploading, setIsUploading] = useState(false);
   const [job, setJob] = useState<JobResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const cancelPollRef = useRef<(() => void) | null>(null);
+
+  useEffect(() => {
+    return () => {
+      cancelPollRef.current?.();
+    };
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
@@ -27,12 +34,10 @@ export default function Home() {
     setError(null);
 
     try {
-      // Upload the file
       const jobResponse = await uploadAudio(file);
       setJob(jobResponse);
 
-      // Start polling for status updates
-      pollJobStatus(jobResponse.job_id, (updatedJob) => {
+      cancelPollRef.current = pollJobStatus(jobResponse.job_id, (updatedJob) => {
         setJob(updatedJob);
         if (updatedJob.status === "failed") {
           setError(updatedJob.error || "Processing failed");

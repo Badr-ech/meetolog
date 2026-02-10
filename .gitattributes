@@ -1,0 +1,40 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Force LF for shell scripts (critical for Unix/Docker execution)
+*.sh text eol=lf
+
+# Force LF for Python files
+*.py text eol=lf
+
+# Force LF for JavaScript/TypeScript/JSON (consistency in Node.js projects)
+*.js text eol=lf
+*.jsx text eol=lf
+*.ts text eol=lf
+*.tsx text eol=lf
+*.json text eol=lf
+
+# Force LF for config files
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+*.dockerignore text eol=lf
+
+# Force LF for documentation
+*.md text eol=lf
+
+# Windows-specific files can use CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary

@@ -2,9 +2,12 @@
 Configuration management using Pydantic Settings.
 Loads environment variables securely with validation.
 
-Key Configuration:
+Key Configuration (v2):
 - TEST_MODE: Enable mock services for CI/CD and testing
 - GEMINI_API_KEY: Google Gemini API key for LLM extraction
+- OPENAI_API_KEY: OpenAI API key for alternative LLM provider
+- LLM_PROVIDER: Which LLM provider to use (gemini, openai)
+- REDIS_URL: Redis connection URL for job state and queue
 """
 
 from functools import lru_cache
@@ -15,19 +18,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """
-    Application settings loaded from environment variables.
-    
-    Environment Variables:
-        TEST_MODE: Set to "true" to use mock services (no API calls)
-        GEMINI_API_KEY: Google Gemini API key for production LLM extraction
-        WHISPER_MODEL: Whisper model size (tiny, base, small, medium, large)
-        DEBUG: Enable debug logging
-        MAX_UPLOAD_SIZE_MB: Maximum audio file upload size
-        UPLOAD_DIR: Directory for temporary uploaded files
-        OUTPUT_DIR: Directory for generated outputs (PDFs, job state)
-    """
-    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -35,27 +25,37 @@ class Settings(BaseSettings):
         extra="ignore",
     )
     
-    # ==========================================================================
-    # CI/CD and Testing
-    # ==========================================================================
-    
     test_mode: bool = Field(
         default=False,
         description="Enable test mode with mock services (no external API calls)"
     )
     
-    # ==========================================================================
-    # API Keys
-    # ==========================================================================
+    redis_url: str = Field(
+        default="redis://localhost:6379",
+        description="Redis connection URL for job state and queue"
+    )
+    
+    redis_job_ttl_days: int = Field(
+        default=7,
+        ge=1,
+        le=30,
+        description="TTL in days for job data in Redis"
+    )
+    
+    llm_provider: Literal["gemini", "openai"] = Field(
+        default="gemini",
+        description="LLM provider to use for artifact extraction"
+    )
     
     gemini_api_key: str = Field(
         default="",
         description="Google Gemini API key for LLM extraction"
     )
     
-    # ==========================================================================
-    # Whisper Configuration
-    # ==========================================================================
+    openai_api_key: str = Field(
+        default="",
+        description="OpenAI API key for alternative LLM provider"
+    )
     
     whisper_model: Literal["tiny", "base", "small", "medium", "large"] = Field(
         default="base",
@@ -98,11 +98,18 @@ class Settings(BaseSettings):
         description="Directory for generated PDFs and job state"
     )
     
+    @field_validator("upload_dir", "output_dir", mode="after")
+    @classmethod
+    def resolve_to_absolute(cls, v: str) -> str:
+        """Resolve relative paths to absolute paths based on cwd."""
+        from pathlib import Path
+        return str(Path(v).resolve())
+    
     # ==========================================================================
     # Validators
     # ==========================================================================
     
-    @field_validator("gemini_api_key", mode="before")
+    @field_validator("gemini_api_key", "openai_api_key", mode="before")
     @classmethod
     def strip_api_key(cls, v: str) -> str:
         """Strip whitespace from API key."""

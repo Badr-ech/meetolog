@@ -20,14 +20,13 @@ from reportlab.platypus import (
     TableStyle,
     ListFlowable,
     ListItem,
+    PageBreak,
 )
 
 from ..models import MeetingArtifacts
 
 
 class PDFGeneratorService:
-    """Generates PDF summaries from meeting artifacts."""
-    
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -35,7 +34,6 @@ class PDFGeneratorService:
         self._setup_custom_styles()
     
     def _setup_custom_styles(self):
-        """Configure custom paragraph styles."""
         self.styles.add(ParagraphStyle(
             name='SectionTitle',
             parent=self.styles['Heading2'],
@@ -55,6 +53,22 @@ class PDFGeneratorService:
             fontSize=10,
             leftIndent=20,
             textColor=colors.HexColor('#4b5563'),
+        ))
+        self.styles.add(ParagraphStyle(
+            name='TaskDescription',
+            parent=self.styles['Normal'],
+            fontSize=9,
+            fontName='Helvetica-Oblique',
+            leftIndent=20,
+            textColor=colors.HexColor('#6b7280'),
+            spaceAfter=4,
+        ))
+        self.styles.add(ParagraphStyle(
+            name='InferredLabel',
+            parent=self.styles['Normal'],
+            fontSize=8,
+            fontName='Helvetica-Oblique',
+            textColor=colors.HexColor('#7c3aed'),
         ))
     
     async def generate(self, artifacts: MeetingArtifacts, filename: str | None = None) -> Path:
@@ -80,7 +94,6 @@ class PDFGeneratorService:
         return output_path
     
     def _create_pdf(self, artifacts: MeetingArtifacts, output_path: Path):
-        """Create the actual PDF document."""
         doc = SimpleDocTemplate(
             str(output_path),
             pagesize=letter,
@@ -214,6 +227,73 @@ class PDFGeneratorService:
                     self.styles['Normal']
                 ))
             story.append(Spacer(1, 12))
+        
+        # Execution Tasks (appended last, on a new page)
+        if artifacts.execution_tasks:
+            story.append(PageBreak())
+            story.append(Paragraph("🚀 Execution Tasks", self.styles['SectionTitle']))
+            story.append(Spacer(1, 8))
+
+            # Table header
+            header_row = ["Status", "Title", "Owner", "Priority"]
+            table_data = [header_row]
+
+            for et in artifacts.execution_tasks:
+                # Visual cue: distinct bullet for source type
+                if et.task_source == "Inferred":
+                    bullet = "◇"  # hollow diamond for inferred
+                    title_text = f"{et.title} <i>(AI Inferred)</i>"
+                else:
+                    bullet = "◆"  # solid diamond for explicit
+                    title_text = et.title
+
+                table_data.append([
+                    Paragraph(bullet, self.styles['Normal']),
+                    Paragraph(title_text, self.styles['Normal']),
+                    et.owner_role,
+                    et.priority,
+                ])
+
+            exec_table = Table(
+                table_data,
+                colWidths=[0.5 * inch, 3.2 * inch, 1.3 * inch, 0.8 * inch],
+            )
+            exec_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#7c3aed')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('ALIGN', (0, 0), (0, -1), 'CENTER'),
+                ('ALIGN', (3, 0), (3, -1), 'CENTER'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [
+                    colors.white, colors.HexColor('#f5f3ff'),
+                ]),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 8),
+            ]))
+            story.append(exec_table)
+            story.append(Spacer(1, 12))
+
+            # Render descriptions below the table for readability
+            for et in artifacts.execution_tasks:
+                source_tag = " (AI Inferred)" if et.task_source == "Inferred" else ""
+                story.append(Paragraph(
+                    f"<b>{et.title}{source_tag}</b>",
+                    self.styles['ItemTitle'],
+                ))
+                story.append(Paragraph(
+                    et.description,
+                    self.styles['TaskDescription'],
+                ))
+                if et.dependencies:
+                    deps = ", ".join(et.dependencies)
+                    story.append(Paragraph(
+                        f"Dependencies: {deps}",
+                        self.styles['TaskDescription'],
+                    ))
+                story.append(Spacer(1, 6))
         
         # Build PDF
         doc.build(story)

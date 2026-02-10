@@ -12,6 +12,7 @@ from datetime import datetime
 
 from ..interfaces import LLMExtractor
 from ..models import (
+    ActionableTask,
     MeetingArtifacts,
     UserStory,
     Task,
@@ -28,7 +29,6 @@ _genai = None
 
 
 def _get_genai():
-    """Lazy load google.generativeai module to allow graceful degradation."""
     global _genai
     if _genai is None:
         try:
@@ -44,22 +44,7 @@ def _get_genai():
 
 
 class GeminiExtractor(LLMExtractor):
-    """
-    Production LLM extractor using Google Gemini API.
-    
-    Implements the LLMExtractor interface for dependency injection.
-    """
-    
     def __init__(self, api_key: str):
-        """
-        Initialize the Gemini extraction service.
-        
-        Args:
-            api_key: Google Gemini API key
-            
-        Raises:
-            ValueError: If API key is empty
-        """
         if not api_key:
             raise ValueError(
                 "GEMINI_API_KEY is required for GeminiExtractor. "
@@ -76,7 +61,6 @@ class GeminiExtractor(LLMExtractor):
         return False
     
     def _get_model(self):
-        """Initialize and return the Gemini model."""
         if self._model is None:
             genai = _get_genai()
             logger.info("Initializing Gemini model")
@@ -86,7 +70,6 @@ class GeminiExtractor(LLMExtractor):
         return self._model
     
     def _build_extraction_prompt(self, transcript: str) -> str:
-        """Build the prompt for structured extraction."""
         return f"""You are an expert Agile Project Manager assistant analyzing a meeting transcript.
 Your task is to extract all relevant Agile artifacts from the transcript and return them as strictly valid JSON.
 
@@ -157,8 +140,29 @@ Required JSON structure:
             "assignee": "name or null",
             "due_date": "string or null"
         }}
+    ],
+    "execution_tasks": [
+        {{
+            "title": "string - concise task title",
+            "description": "string - detailed description of work required",
+            "owner_role": "string - responsible role (Engineering, Design, Product, DevOps, QA) or specific name",
+            "priority": "High|Medium|Low",
+            "task_source": "Explicit|Inferred",
+            "dependencies": ["list of other tasks or conditions this depends on"]
+        }}
     ]
 }}
+
+### Task Extraction & Inference Protocol
+You must analyze the transcript to generate a list of 'execution_tasks'.
+1.  **Explicit Tasks:** Identify clearly stated action items (e.g., "John will update the API").
+2.  **Inferred Tasks:** Deduce necessary work based on Decisions or Blockers.
+    *   *Example:* If a decision is "Switch to Postgres," infer a task: "Provision Postgres instance" (Role: DevOps).
+    *   *Example:* If a blocker is "Missing UI designs," infer a task: "Finalize UI Mocks" (Role: Design).
+3.  **Schema Enforcement:**
+    *   Assign a logical `owner_role` based on the task nature if a person isn't named.
+    *   Set `task_source` to 'Explicit' or 'Inferred' accordingly.
+    *   **Anti-Hallucination:** Do not invent tasks for features not discussed. Only infer steps necessary to achieve the meeting's stated goals.
 
 If no items exist for a category, return an empty array [].
 Now analyze the transcript and return the JSON:"""
@@ -287,6 +291,18 @@ Now analyze the transcript and return the JSON:"""
             for a in data.get("action_items", [])
         ]
         
+        execution_tasks = [
+            ActionableTask(
+                title=et.get("title", ""),
+                description=et.get("description", ""),
+                owner_role=et.get("owner_role", "Engineering"),
+                priority=et.get("priority", "Medium"),
+                task_source=et.get("task_source", "Explicit"),
+                dependencies=et.get("dependencies", []),
+            )
+            for et in data.get("execution_tasks", [])
+        ]
+        
         return MeetingArtifacts(
             meeting_title=data.get("meeting_title", "Meeting"),
             meeting_date=datetime.now(),
@@ -297,5 +313,6 @@ Now analyze the transcript and return the JSON:"""
             decisions=decisions,
             blockers=blockers,
             action_items=action_items,
+            execution_tasks=execution_tasks,
             transcript=transcript,
         )

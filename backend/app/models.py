@@ -5,13 +5,13 @@ These define the structured output format of the semantic extraction.
 
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
 
 class Priority(str, Enum):
-    """Priority levels for tasks and stories."""
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
@@ -19,7 +19,6 @@ class Priority(str, Enum):
 
 
 class TaskStatus(str, Enum):
-    """Status options for tasks."""
     TODO = "todo"
     IN_PROGRESS = "in_progress"
     BLOCKED = "blocked"
@@ -27,7 +26,6 @@ class TaskStatus(str, Enum):
 
 
 class Task(BaseModel):
-    """A task extracted from meeting discussion."""
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(..., description="Brief task description")
     description: str = Field(default="", description="Detailed task information")
@@ -38,7 +36,6 @@ class Task(BaseModel):
 
 
 class UserStory(BaseModel):
-    """A user story in standard Agile format."""
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(..., description="Story title")
     as_a: str = Field(..., description="The user role (As a...)")
@@ -50,7 +47,6 @@ class UserStory(BaseModel):
 
 
 class Decision(BaseModel):
-    """A decision made during the meeting."""
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(..., description="Decision summary")
     description: str = Field(..., description="Full decision details")
@@ -60,7 +56,6 @@ class Decision(BaseModel):
 
 
 class Blocker(BaseModel):
-    """A blocker or impediment identified in the meeting."""
     id: UUID = Field(default_factory=uuid4)
     title: str = Field(..., description="Blocker summary")
     description: str = Field(..., description="Details about the blocker")
@@ -70,11 +65,28 @@ class Blocker(BaseModel):
 
 
 class ActionItem(BaseModel):
-    """A general action item that doesn't fit other categories."""
     id: UUID = Field(default_factory=uuid4)
     description: str
     assignee: str | None = None
     due_date: str | None = None
+
+
+class ActionableTask(BaseModel):
+    title: str = Field(..., description="Concise task title")
+    description: str = Field(..., description="Detailed description of work required")
+    owner_role: str = Field(
+        ...,
+        description="Responsible role (e.g., Engineering, Design, Product) or specific name if mentioned",
+    )
+    priority: Literal["High", "Medium", "Low"] = Field(default="Medium")
+    task_source: Literal["Explicit", "Inferred"] = Field(
+        ...,
+        description="Whether this task was directly stated or logically inferred",
+    )
+    dependencies: list[str] = Field(
+        default_factory=list,
+        description="Other tasks or conditions this task depends on",
+    )
 
 
 class MeetingArtifacts(BaseModel):
@@ -92,6 +104,7 @@ class MeetingArtifacts(BaseModel):
     decisions: list[Decision] = Field(default_factory=list)
     blockers: list[Blocker] = Field(default_factory=list)
     action_items: list[ActionItem] = Field(default_factory=list)
+    execution_tasks: list[ActionableTask] = Field(default_factory=list)
     
     # Raw data
     transcript: str = Field(default="", description="Full meeting transcript")

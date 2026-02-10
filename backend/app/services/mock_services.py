@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from ..interfaces import Transcriber, LLMExtractor
 from ..models import (
+    ActionableTask,
     MeetingArtifacts,
     UserStory,
     Task,
@@ -36,14 +37,6 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class MockTranscriber(Transcriber):
-    """
-    Mock transcription service for testing.
-    
-    Returns a realistic hardcoded transcript instantly, simulating
-    what a real transcription might look like without any API calls.
-    """
-    
-    # Realistic sample transcript for testing
     MOCK_TRANSCRIPT = """
 Okay everyone, let's get started with our sprint planning meeting. I'm Sarah, the product owner, 
 and we have the dev team here - Mike, Lisa, and John.
@@ -91,12 +84,6 @@ Sarah: Perfect. Let's wrap up. Good meeting everyone!
 """.strip()
     
     def __init__(self, simulated_delay: float = 0.5):
-        """
-        Initialize the mock transcriber.
-        
-        Args:
-            simulated_delay: Seconds to wait before returning (simulates processing)
-        """
         self._delay = simulated_delay
         logger.info("MockTranscriber initialized (TEST_MODE)")
     
@@ -157,6 +144,11 @@ class MockExtractor(LLMExtractor):
         """
         self._delay = simulated_delay
         logger.info("MockExtractor initialized (TEST_MODE)")
+    
+    @property
+    def provider_name(self) -> str:
+        """Human-readable provider name."""
+        return "Mock"
     
     @property
     def is_mock(self) -> bool:
@@ -291,6 +283,56 @@ class MockExtractor(LLMExtractor):
                     description="Document acceptance criteria for password validation",
                     assignee="Sarah",
                     due_date=None,
+                ),
+            ],
+            execution_tasks=[
+                ActionableTask(
+                    title="Implement Backend Authentication",
+                    description="Set up JWT tokens, database schema for users, login and registration endpoints",
+                    owner_role="Mike",
+                    priority="High",
+                    task_source="Explicit",
+                    dependencies=[],
+                ),
+                ActionableTask(
+                    title="Create Frontend Login Forms",
+                    description="Build login and registration forms with validation and error handling",
+                    owner_role="Lisa",
+                    priority="High",
+                    task_source="Explicit",
+                    dependencies=["Implement Backend Authentication"],
+                ),
+                ActionableTask(
+                    title="Configure Email Service",
+                    description="Set up email service for password reset and notification emails, blocking password reset flow",
+                    owner_role="Mike",
+                    priority="High",
+                    task_source="Explicit",
+                    dependencies=[],
+                ),
+                ActionableTask(
+                    title="Implement Password Reset Flow",
+                    description="Create password reset request and confirmation endpoints with email integration",
+                    owner_role="John",
+                    priority="Medium",
+                    task_source="Explicit",
+                    dependencies=["Configure Email Service"],
+                ),
+                ActionableTask(
+                    title="Set Up Refresh Token Rotation",
+                    description="Implement refresh token issuance and rotation mechanism per the 30-minute session timeout decision",
+                    owner_role="Engineering",
+                    priority="Medium",
+                    task_source="Inferred",
+                    dependencies=["Implement Backend Authentication"],
+                ),
+                ActionableTask(
+                    title="Add Login Rate Limiting",
+                    description="Implement rate limiting after 5 failed login attempts as required by acceptance criteria",
+                    owner_role="Engineering",
+                    priority="Medium",
+                    task_source="Inferred",
+                    dependencies=["Implement Backend Authentication"],
                 ),
             ],
             transcript=transcript,

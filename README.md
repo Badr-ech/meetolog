@@ -13,7 +13,8 @@ Meetolog is an MVP system that:
    - Decisions (with rationale)
    - Blockers (with resolution plans)
    - Action Items
-4. **Generates** a downloadable PDF summary
+   - **Execution Tasks** – AI-inferred actionable work items derived from explicit statements *and* logical implications of decisions/blockers, with owner roles, priorities, and dependency tracking
+4. **Generates** a downloadable PDF summary (including a dedicated Execution Tasks page)
 
 ---
 
@@ -83,7 +84,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 In test mode:
 - **MockTranscriber** returns a realistic hardcoded transcript instantly
-- **MockExtractor** returns deterministic Agile artifacts matching the schema
+- **MockExtractor** returns deterministic Agile artifacts matching the schema (including sample Execution Tasks with both Explicit and Inferred sources)
 - No Whisper model loading (faster startup)
 - No Gemini API calls (no API key required)
 - Perfect for CI/CD pipelines and automated testing
@@ -99,18 +100,28 @@ meetolog/
 │   │   ├── __init__.py
 │   │   ├── main.py              # FastAPI entry point & endpoints
 │   │   ├── config.py            # Environment configuration
-│   │   ├── models.py            # Pydantic models for Agile artifacts
+│   │   ├── models.py            # Pydantic models (incl. ActionableTask)
 │   │   ├── interfaces.py        # Abstract base classes (JobStore, Transcriber, LLMExtractor)
 │   │   ├── dependencies.py      # Factory pattern & dependency injection
+│   │   ├── worker.py            # Background job processing
+│   │   ├── load_dataset.py      # Dataset loading utilities
+│   │   ├── infrastructure/
+│   │   │   ├── __init__.py
+│   │   │   ├── job_store.py     # Job persistence infrastructure
+│   │   │   └── redis.py         # Redis connection management
 │   │   └── services/
 │   │       ├── __init__.py
 │   │       ├── transcription.py    # WhisperTranscriber (production)
-│   │       ├── llm_extraction.py   # GeminiExtractor (production)
-│   │       ├── pdf_generator.py    # ReportLab PDF generation
+│   │       ├── llm_extraction.py   # GeminiExtractor + Task Inference Protocol
+│   │       ├── llm_engine.py       # LLM engine abstraction
+│   │       ├── pdf_generator.py    # ReportLab PDF generation (incl. Execution Tasks)
 │   │       ├── job_store.py        # LocalJobStore (in-memory + file backup)
 │   │       └── mock_services.py    # MockTranscriber & MockExtractor (testing)
 │   ├── requirements.txt
-│   └── .env.example
+│   ├── dataset_audio/           # Sample audio files
+│   ├── outputs/                 # Generated PDFs and job state
+│   ├── uploads/                 # Temporary upload storage
+│   └── .env / .env.example
 │
 ├── frontend/
 │   ├── app/
@@ -124,7 +135,11 @@ meetolog/
 │   ├── next.config.js           # API rewrites for CORS
 │   └── tsconfig.json
 │
+├── docs/
+│   └── TECHNICAL_DESIGN_V2.md   # Technical design document
+│
 ├── AI_CONTEXT.md                # AI coding context
+├── LICENSE
 └── README.md
 ```
 
@@ -259,24 +274,27 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 
 ### Backend
 - **FastAPI** - Modern async web framework
+- **ARQ** - Async Redis-backed job queue for background processing
+- **Redis** - Job state persistence and task queue
 - **Pydantic** - Data validation with type hints
 - **OpenAI Whisper** - Local speech-to-text model
 - **google-generativeai** - Gemini LLM integration
+- **OpenAI SDK** - Alternative LLM provider
 - **ReportLab** - PDF generation
 - **aiofiles** - Async file I/O
 
 ### Frontend
-- **Next.js 14** - React framework with App Router
+- **Next.js 14+** - React framework with App Router
 - **TypeScript** - Type safety
 - **CSS Modules** - Scoped styling
 
 ---
 
-## 🔮 Future Enhancements (Version 2)
+## 🔮 Future Enhancements
 
-- [ ] **RedisJobStore** - Replace LocalJobStore for horizontal scaling
 - [ ] **User authentication** - Multi-user support
 - [ ] **PostgreSQL persistence** - Replace local file storage
+- [ ] **Cloud object storage** - S3/R2 for uploads and PDFs
 - [ ] **Export to Jira/Azure DevOps** - Direct integration
 - [ ] **Real-time WebSocket updates** - Replace polling
 - [ ] **Multiple language support** - Whisper already supports this
@@ -289,9 +307,9 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 ### Service Abstraction Layer
 The backend uses an interface-based architecture for easy testing and future extensibility:
 
-- **`JobStore`** (interface) → `LocalJobStore` (MVP) → `RedisJobStore` (V2)
+- **`JobStore`** (interface) → `RedisJobStore` (v2, production)
 - **`Transcriber`** (interface) → `WhisperTranscriber` (production) / `MockTranscriber` (test)
-- **`LLMExtractor`** (interface) → `GeminiExtractor` (production) / `MockExtractor` (test)
+- **`LLMExtractor`** (interface) → `GeminiExtractor` or `OpenAIExtractor` (production) / `MockExtractor` (test)
 
 ### Factory Pattern
 Services are instantiated via `dependencies.py` based on configuration:
@@ -300,10 +318,13 @@ Services are instantiated via `dependencies.py` based on configuration:
 - Production mode → Real Whisper + Gemini
 
 ### Async Processing
-The backend uses FastAPI's `BackgroundTasks` for non-blocking audio processing. Job state is persisted to disk for crash recovery.
+The backend uses ARQ (Async Redis Queue) for non-blocking audio processing. Jobs are dispatched to a separate worker process and state is persisted in Redis for reliability.
 
 ### CORS Handling
-The frontend uses Next.js rewrites in `next.config.js` to proxy API calls, avoiding CORS issues during development.
+The frontend uses Next.js rewrites in `next.config.js` to proxy API calls, avoiding CORS issues. The backend URL is configurable via `NEXT_PUBLIC_API_URL`.
+
+### Deployment
+See [DEPLOYMENT.md](DEPLOYMENT.md) for a full step-by-step runbook (Railway + Vercel) and [ENVIRONMENT.md](ENVIRONMENT.md) for the complete environment variable reference.
 
 ---
 

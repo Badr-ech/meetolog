@@ -21,76 +21,24 @@ from .models import JobResponse, MeetingArtifacts
 # =============================================================================
 
 class JobStore(ABC):
-    """
-    Abstract interface for job state persistence.
-    
-    Implementations:
-    - LocalJobStore: In-memory dict + local JSON file backup (MVP)
-    - RedisJobStore: Redis-backed storage (Version 2)
-    """
-    
     @abstractmethod
     async def save(self, job_id: UUID, job: JobResponse) -> None:
-        """
-        Save or create a new job.
-        
-        Args:
-            job_id: Unique identifier for the job
-            job: The job response object to persist
-        """
         ...
     
     @abstractmethod
     async def load(self, job_id: UUID) -> JobResponse | None:
-        """
-        Load a job by its ID.
-        
-        Args:
-            job_id: The job identifier to look up
-            
-        Returns:
-            The JobResponse if found, None otherwise
-        """
         ...
     
     @abstractmethod
     async def update(self, job_id: UUID, **kwargs: Any) -> JobResponse | None:
-        """
-        Update specific fields of an existing job.
-        
-        Args:
-            job_id: The job identifier to update
-            **kwargs: Fields to update (e.g., status, progress, message)
-            
-        Returns:
-            The updated JobResponse if found, None otherwise
-        """
         ...
     
     @abstractmethod
     async def exists(self, job_id: UUID) -> bool:
-        """
-        Check if a job exists.
-        
-        Args:
-            job_id: The job identifier to check
-            
-        Returns:
-            True if the job exists, False otherwise
-        """
         ...
     
     @abstractmethod
     async def delete(self, job_id: UUID) -> bool:
-        """
-        Delete a job from the store.
-        
-        Args:
-            job_id: The job identifier to delete
-            
-        Returns:
-            True if deleted, False if not found
-        """
         ...
 
 

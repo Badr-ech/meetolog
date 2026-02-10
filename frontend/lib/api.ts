@@ -4,6 +4,8 @@
 
 const API_BASE = "/api";
 
+const BACKEND_DIRECT = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
 export interface JobResponse {
   job_id: string;
   status: "pending" | "transcribing" | "extracting" | "generating_pdf" | "completed" | "failed";
@@ -75,14 +77,11 @@ export interface ActionItem {
   due_date: string | null;
 }
 
-/**
- * Upload an audio file for processing.
- */
 export async function uploadAudio(file: File): Promise<JobResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${API_BASE}/upload`, {
+  const response = await fetch(`${BACKEND_DIRECT}/upload`, {
     method: "POST",
     body: formData,
   });
@@ -95,9 +94,6 @@ export async function uploadAudio(file: File): Promise<JobResponse> {
   return response.json();
 }
 
-/**
- * Poll the job status until completion or failure.
- */
 export async function getJobStatus(jobId: string): Promise<JobResponse> {
   const response = await fetch(`${API_BASE}/status/${jobId}`);
 
@@ -109,16 +105,10 @@ export async function getJobStatus(jobId: string): Promise<JobResponse> {
   return response.json();
 }
 
-/**
- * Get the URL for downloading the PDF.
- */
 export function getPdfDownloadUrl(jobId: string): string {
   return `${API_BASE}/download/${jobId}`;
 }
 
-/**
- * Poll job status with a callback, returns cleanup function.
- */
 export function pollJobStatus(
   jobId: string,
   onUpdate: (job: JobResponse) => void,

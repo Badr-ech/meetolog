@@ -46,12 +46,6 @@ _extractor: LLMExtractor | None = None
 # =============================================================================
 
 def create_job_store(settings: Settings) -> JobStore:
-    """
-    Create and return a JobStore instance.
-    
-    Currently only LocalJobStore is implemented.
-    Redis support can be added by checking settings.redis_url.
-    """
     from .services.job_store import LocalJobStore
     
     logger.info("Creating LocalJobStore instance")
@@ -63,20 +57,12 @@ def create_job_store(settings: Settings) -> JobStore:
 
 
 def create_transcriber(settings: Settings) -> Transcriber:
-    """
-    Create and return a Transcriber instance based on configuration.
-    
-    Logic:
-    1. If TEST_MODE=true → MockTranscriber
-    2. Otherwise → WhisperTranscriber (production)
-    """
     if settings.test_mode:
         from .services.mock_services import MockTranscriber
         
         logger.info("TEST_MODE enabled: Using MockTranscriber")
         return MockTranscriber(simulated_delay=0.5)
     
-    # Production mode - use real Whisper
     try:
         from .services.transcription import WhisperTranscriber
         
@@ -86,7 +72,6 @@ def create_transcriber(settings: Settings) -> Transcriber:
     except Exception as e:
         logger.error(f"Failed to initialize WhisperTranscriber: {e}")
         
-        # Graceful degradation to mock
         from .services.mock_services import MockTranscriber
         
         logger.warning("Falling back to MockTranscriber due to initialization failure")
@@ -141,11 +126,6 @@ def create_extractor(settings: Settings) -> LLMExtractor:
 # =============================================================================
 
 def get_job_store() -> JobStore:
-    """
-    Get the singleton JobStore instance.
-    
-    FastAPI Dependency that returns the configured JobStore.
-    """
     global _job_store
     
     if _job_store is None:
@@ -156,11 +136,6 @@ def get_job_store() -> JobStore:
 
 
 def get_transcriber() -> Transcriber:
-    """
-    Get the singleton Transcriber instance.
-    
-    FastAPI Dependency that returns the configured Transcriber.
-    """
     global _transcriber
     
     if _transcriber is None:
@@ -171,11 +146,6 @@ def get_transcriber() -> Transcriber:
 
 
 def get_extractor() -> LLMExtractor:
-    """
-    Get the singleton LLMExtractor instance.
-    
-    FastAPI Dependency that returns the configured LLMExtractor.
-    """
     global _extractor
     
     if _extractor is None:
@@ -189,56 +159,38 @@ def get_extractor() -> LLMExtractor:
 # Type Aliases for FastAPI Depends
 # =============================================================================
 
-# Use these in endpoint function signatures for cleaner code:
-# async def endpoint(job_store: JobStoreDep, transcriber: TranscriberDep):
-
 JobStoreDep = Annotated[JobStore, Depends(get_job_store)]
 TranscriberDep = Annotated[Transcriber, Depends(get_transcriber)]
 LLMExtractorDep = Annotated[LLMExtractor, Depends(get_extractor)]
 
 
 # =============================================================================
-# Initialization & Cleanup
+# Initialization & Cleanup (v2 - mostly deprecated, kept for backwards compat)
 # =============================================================================
 
 async def initialize_services() -> None:
-    """
-    Initialize all services on application startup.
-    
-    Called from FastAPI lifespan event.
-    """
     settings = get_settings()
     
     logger.info("=" * 60)
-    logger.info("Initializing Meetolog services...")
+    logger.info("Initializing Meetolog services (v2)...")
     logger.info(f"  TEST_MODE: {settings.test_mode}")
+    logger.info(f"  LLM_PROVIDER: {settings.llm_provider}")
     logger.info(f"  GEMINI_API_KEY: {'[SET]' if settings.gemini_api_key else '[NOT SET]'}")
+    logger.info(f"  OPENAI_API_KEY: {'[SET]' if settings.openai_api_key else '[NOT SET]'}")
+    logger.info(f"  REDIS_URL: {settings.redis_url}")
     logger.info("=" * 60)
     
-    # Initialize job store and load persisted state
-    job_store = get_job_store()
+    if settings.test_mode:
+        transcriber = get_transcriber()
+        extractor = get_extractor()
+        
+        logger.info(f"  Transcriber: {type(transcriber).__name__}")
+        logger.info(f"  Extractor: {type(extractor).__name__} (mock={extractor.is_mock})")
     
-    # Import LocalJobStore type for type checking
-    from .services.job_store import LocalJobStore
-    if isinstance(job_store, LocalJobStore):
-        loaded = await job_store.load_from_disk()
-        logger.info(f"Loaded {loaded} persisted jobs from disk")
-    
-    # Pre-initialize other services
-    transcriber = get_transcriber()
-    extractor = get_extractor()
-    
-    logger.info(f"  Transcriber: {type(transcriber).__name__}")
-    logger.info(f"  Extractor: {type(extractor).__name__} (mock={extractor.is_mock})")
     logger.info("Services initialized successfully!")
 
 
 def reset_services() -> None:
-    """
-    Reset all singleton services.
-    
-    Useful for testing to ensure clean state between tests.
-    """
     global _job_store, _transcriber, _extractor
     
     _job_store = None

@@ -1,36 +1,36 @@
 """
-Meetolog Backend - FastAPI Application
+Meetolog Backend - FastAPI Application (v2)
 Main entry point with API endpoints for audio processing.
 
-IMPORTANT - Deployment Constraints:
-- This application MUST run as a single instance (workers=1)
-- Uses local file storage for job state (no horizontal scaling)
-- Requires ffmpeg installed on the host system
+v2 Architecture:
+- Redis-backed job state persistence
+- ARQ background queue for processing
+- Horizontal scaling ready
 """
 
 import logging
-import shutil
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, UploadFile, HTTPException, BackgroundTasks
+import aiofiles
+from arq import create_pool
+from arq.connections import ArqRedis
+from fastapi import FastAPI, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .config import get_settings
-from .dependencies import (
-    get_job_store,
-    get_transcriber,
-    get_extractor,
-    initialize_services,
-    JobStoreDep,
-    TranscriberDep,
-    LLMExtractorDep,
-)
 from .models import JobResponse, ProcessingStatus, MeetingArtifacts
-
+from .infrastructure.redis import (
+    get_redis_pool,
+    close_redis_pool,
+    get_arq_redis_settings,
+    check_redis_health,
+)
+from .infrastructure.job_store import RedisJobStore
 
 # Configure logging
 logging.basicConfig(
@@ -40,18 +40,34 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# PDF service singleton (lazy initialized)
-_pdf_service = None
+# Initialize settings
+settings = get_settings()
+
+# ARQ connection pool (singleton)
+_arq_pool: ArqRedis | None = None
 
 
-def get_pdf_service():
-    """Get or create the PDF generator service."""
-    global _pdf_service
-    if _pdf_service is None:
-        from .services import PDFGeneratorService
-        settings = get_settings()
-        _pdf_service = PDFGeneratorService(Path(settings.output_dir))
-    return _pdf_service
+# =============================================================================
+# Dependency Injection
+# =============================================================================
+
+async def get_job_store() -> RedisJobStore:
+    redis = await get_redis_pool()
+    return RedisJobStore(redis)
+
+
+async def get_arq_pool() -> ArqRedis:
+    global _arq_pool
+    
+    if _arq_pool is None:
+        _arq_pool = await create_pool(get_arq_redis_settings())
+        logger.info("ARQ connection pool created")
+    
+    return _arq_pool
+
+
+# Type alias for cleaner endpoint signatures
+JobStoreDep = Annotated[RedisJobStore, Depends(get_job_store)]
 
 
 # =============================================================================
@@ -60,27 +76,55 @@ def get_pdf_service():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifespan event handler.
+    global _arq_pool
     
-    Startup: Initialize services, load persisted job state
-    Shutdown: Clean up resources
-    """
     # Startup
-    logger.info("Starting Meetolog API...")
-    await initialize_services()
+    logger.info("🚀 Starting Meetolog API (v2)...")
+    
+    # Initialize Redis
+    try:
+        redis = await get_redis_pool()
+        logger.info("✅ Redis connection established")
+    except Exception as e:
+        logger.error(f"❌ Failed to connect to Redis: {e}")
+        logger.warning("API starting without Redis - endpoints may fail")
+    
+    # Initialize ARQ pool
+    try:
+        _arq_pool = await create_pool(get_arq_redis_settings())
+        logger.info("✅ ARQ connection pool created")
+    except Exception as e:
+        logger.error(f"❌ Failed to create ARQ pool: {e}")
+        logger.warning("API starting without ARQ - job enqueueing will fail")
+    
+    # Ensure directories exist
+    Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+    Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"📁 Upload directory: {settings.upload_dir}")
+    logger.info(f"📁 Output directory: {settings.output_dir}")
+    logger.info(f"🤖 LLM Provider: {settings.llm_provider}")
+    logger.info(f"🧪 Test Mode: {settings.test_mode}")
     
     yield
     
     # Shutdown
-    logger.info("Shutting down Meetolog API...")
+    logger.info("🛑 Shutting down Meetolog API...")
+    
+    if _arq_pool is not None:
+        await _arq_pool.close()
+        _arq_pool = None
+    
+    await close_redis_pool()
+    
+    logger.info("✅ Shutdown complete")
 
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Meetolog API",
-    description="Transform meeting recordings into structured Agile artifacts",
-    version="1.0.0",
+    description="Transform meeting recordings into structured Agile artifacts (v2)",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -93,132 +137,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize settings
-settings = get_settings()
-
 
 def get_upload_dir() -> Path:
-    """Get and ensure upload directory exists."""
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
     return upload_dir
 
 
-async def process_audio(
-    job_id: UUID,
-    audio_path: Path,
-    job_store: JobStoreDep,
-    transcriber: TranscriberDep,
-    extractor: LLMExtractorDep,
-):
-    """
-    Background task to process an audio file through the full pipeline.
-    
-    Pipeline:
-    1. Transcribe audio to text
-    2. Preprocess the transcript
-    3. Extract Agile artifacts using LLM
-    4. Generate PDF summary
-    
-    Args:
-        job_id: Unique identifier for the job
-        audio_path: Path to the uploaded audio file
-        job_store: Job storage instance (injected)
-        transcriber: Transcription service (injected)
-        extractor: LLM extraction service (injected)
-    """
-    try:
-        # Step 1: Transcription
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.TRANSCRIBING,
-            progress=20,
-            message="Transcribing audio..."
-        )
-        
-        raw_transcript = await transcriber.transcribe(audio_path)
-        transcript = await transcriber.preprocess_transcript(raw_transcript)
-        
-        # Step 2: LLM Extraction
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.EXTRACTING,
-            progress=50,
-            message="Extracting Agile artifacts..."
-        )
-        
-        artifacts = await extractor.extract_artifacts(transcript)
-        
-        # Step 3: PDF Generation
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.GENERATING_PDF,
-            progress=80,
-            message="Generating PDF summary..."
-        )
-        
-        pdf_service = get_pdf_service()
-        pdf_filename = f"meeting_{job_id}.pdf"
-        pdf_path = await pdf_service.generate(artifacts, pdf_filename)
-        
-        # Complete
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.COMPLETED,
-            progress=100,
-            message="Processing complete!",
-            artifacts=artifacts,
-            pdf_url=f"/download/{job_id}"
-        )
-        
-        logger.info(f"Job {job_id} completed successfully")
-        
-    except Exception as e:
-        logger.error(f"Job {job_id} failed: {e}")
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.FAILED,
-            error=str(e),
-            message=f"Processing failed: {e}"
-        )
-    
-    finally:
-        # Cleanup uploaded file
-        if audio_path.exists():
-            audio_path.unlink()
-            logger.debug(f"Cleaned up uploaded file: {audio_path}")
-
+# =============================================================================
+# API Endpoints
+# =============================================================================
 
 @app.get("/")
 async def root():
-    """Health check endpoint with service status."""
-    settings = get_settings()
-    extractor = get_extractor()
+    redis_health = await check_redis_health()
     
     return {
         "service": "Meetolog API",
-        "status": "healthy",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "status": "healthy" if redis_health["status"] == "healthy" else "degraded",
         "test_mode": settings.test_mode,
-        "using_mock_llm": extractor.is_mock,
+        "llm_provider": settings.llm_provider,
+        "redis": redis_health,
     }
 
 
 @app.post("/upload", response_model=JobResponse)
 async def upload_audio(
     file: UploadFile,
-    background_tasks: BackgroundTasks,
     job_store: JobStoreDep,
-    transcriber: TranscriberDep,
-    extractor: LLMExtractorDep,
 ):
     """
     Upload an audio file for processing.
     
-    Accepts audio files (mp3, wav, m4a, ogg, webm) and triggers
-    background processing to extract meeting artifacts.
+    Accepts audio files (mp3, wav, m4a, ogg, webm) and enqueues
+    a background job for processing.
     
     Returns a job ID to track processing status.
+    
+    API Contract (v1 compatible):
+    - POST /upload with multipart form data
+    - Returns: { job_id, status, message, progress }
     """
     # Validate file type
     if not file.filename:
@@ -234,7 +193,8 @@ async def upload_audio(
     
     # Validate file size
     file.file.seek(0, 2)  # Seek to end
-    size_mb = file.file.tell() / (1024 * 1024)
+    file_size = file.file.tell()
+    size_mb = file_size / (1024 * 1024)
     file.file.seek(0)  # Reset
     
     if size_mb > settings.max_upload_size_mb:
@@ -243,32 +203,68 @@ async def upload_audio(
             detail=f"File too large: {size_mb:.1f}MB. Max: {settings.max_upload_size_mb}MB",
         )
     
-    # Save uploaded file
+    # Generate job ID and save file
     job_id = uuid4()
     upload_dir = get_upload_dir()
     audio_path = upload_dir / f"{job_id}{file_ext}"
     
-    with open(audio_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    # Save file asynchronously
+    content = await file.read()
+    async with aiofiles.open(audio_path, "wb") as f:
+        await f.write(content)
     
-    # Create job record
+    logger.info(f"File uploaded: {file.filename} -> {audio_path} ({size_mb:.2f} MB)")
+    
+    # Create job record in Redis with QUEUED status
     job = JobResponse(
         job_id=job_id,
-        status=ProcessingStatus.PENDING,
-        message="File uploaded, processing starting...",
+        status=ProcessingStatus.PENDING,  # PENDING = QUEUED in v1 API
+        message="Job queued for processing",
         progress=0,
     )
-    await job_store.save(job_id, job)
     
-    # Trigger background processing
-    background_tasks.add_task(
-        process_audio,
+    await job_store.save(
         job_id,
-        audio_path,
-        job_store,
-        transcriber,
-        extractor,
+        job,
+        file_path=str(audio_path),
+        file_name=file.filename,
+        file_size=file_size,
     )
+    
+    # Enqueue job to ARQ worker
+    try:
+        arq_pool = await get_arq_pool()
+        
+        arq_job = await arq_pool.enqueue_job(
+            "process_audio_job",
+            job_id=str(job_id),
+            file_path=str(audio_path),
+            file_name=file.filename,
+            file_size=file_size,
+            _job_id=str(job_id),  # Use our job_id as ARQ job_id
+        )
+        
+        logger.info(f"Job {job_id} enqueued to ARQ (arq_job_id: {arq_job.job_id})")
+        
+    except Exception as e:
+        logger.error(f"Failed to enqueue job {job_id}: {e}")
+        
+        # Update job status to failed
+        await job_store.update(
+            job_id,
+            status=ProcessingStatus.FAILED,
+            error=f"Failed to enqueue job: {e}",
+            message="Job enqueueing failed",
+        )
+        
+        # Clean up uploaded file
+        if audio_path.exists():
+            audio_path.unlink()
+        
+        raise HTTPException(
+            status_code=503,
+            detail="Job queue unavailable. Please try again later.",
+        )
     
     return job
 
@@ -279,6 +275,10 @@ async def get_job_status(job_id: UUID, job_store: JobStoreDep):
     Get the current status of a processing job.
     
     Returns progress, status, and artifacts when complete.
+    
+    API Contract (v1 compatible):
+    - GET /status/{job_id}
+    - Returns: { job_id, status, message, progress, artifacts?, pdf_url?, error? }
     """
     job = await job_store.load(job_id)
     
@@ -292,6 +292,10 @@ async def get_job_status(job_id: UUID, job_store: JobStoreDep):
 async def download_pdf(job_id: UUID, job_store: JobStoreDep):
     """
     Download the generated PDF summary for a completed job.
+    
+    API Contract (v1 compatible):
+    - GET /download/{job_id}
+    - Returns: PDF file (application/pdf)
     """
     job = await job_store.load(job_id)
     
@@ -320,6 +324,10 @@ async def download_pdf(job_id: UUID, job_store: JobStoreDep):
 async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
     """
     Get the extracted artifacts as JSON for a completed job.
+    
+    API Contract (v1 compatible):
+    - GET /artifacts/{job_id}
+    - Returns: MeetingArtifacts JSON
     """
     job = await job_store.load(job_id)
     
@@ -333,9 +341,61 @@ async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
         )
     
     if not job.artifacts:
-        raise HTTPException(status_code=404, detail="Artifacts not found")
+        # Try loading from cache directly
+        artifacts = await job_store.get_cached_artifacts(job_id)
+        if not artifacts:
+            raise HTTPException(status_code=404, detail="Artifacts not found")
+        return artifacts
     
     return job.artifacts
+
+
+# =============================================================================
+# Health & Debugging Endpoints
+# =============================================================================
+
+@app.get("/health")
+async def health_check():
+    """
+    Detailed health check for monitoring systems.
+    
+    Checks:
+    - Redis connectivity
+    - ARQ worker queue status
+    """
+    redis_health = await check_redis_health()
+    
+    # Check if ARQ pool is connected
+    arq_status = "unknown"
+    try:
+        arq_pool = await get_arq_pool()
+        # Check queue length (ARQ default queue key)
+        redis = await get_redis_pool()
+        queue_len = await redis.llen("arq:queue")
+        arq_status = "healthy"
+    except Exception as e:
+        arq_status = f"unhealthy: {e}"
+        queue_len = -1
+    
+    overall_status = "healthy"
+    if redis_health["status"] != "healthy" or arq_status != "healthy":
+        overall_status = "degraded"
+    
+    return {
+        "status": overall_status,
+        "components": {
+            "redis": redis_health,
+            "arq": {
+                "status": arq_status,
+                "queue_length": queue_len,
+            },
+        },
+        "config": {
+            "test_mode": settings.test_mode,
+            "llm_provider": settings.llm_provider,
+            "redis_url": settings.redis_url.split("@")[-1] if "@" in settings.redis_url else settings.redis_url,  # Hide password
+        },
+    }
 
 
 # =============================================================================
@@ -345,16 +405,12 @@ async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
 if __name__ == "__main__":
     import uvicorn
     
-    # CRITICAL: Run with workers=1 to avoid race conditions
-    # This application uses local file/memory storage for job state.
-    # Multiple workers would cause data loss and inconsistent state.
-    # For horizontal scaling, implement RedisJobStore (Version 2).
-    
+    # v2 supports horizontal scaling with multiple workers
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,  # MUST be 1 for local storage
+        workers=1,  # Use 1 for development, increase for production
         reload=settings.debug,
         log_level="info",
     )
