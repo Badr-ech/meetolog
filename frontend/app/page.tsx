@@ -50,7 +50,7 @@ export default function Home() {
     }
   }, [file]);
 
-  const isProcessing = job && !["completed", "failed"].includes(job.status);
+  const isProcessing = !!(job && !["completed", "failed"].includes(job.status));
   const isCompleted = job?.status === "completed";
 
   return (
