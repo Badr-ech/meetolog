@@ -13,10 +13,20 @@ set -euo pipefail
 
 SERVICE_TYPE="${SERVICE_TYPE:-web}"
 PORT="${PORT:-8000}"
+RUN_WORKER="${RUN_WORKER:-false}"
 
 echo "=========================================="
 echo " Meetolog – Starting service: ${SERVICE_TYPE}"
 echo "=========================================="
+
+# If RUN_WORKER=true, start the ARQ worker in the background
+# alongside the main service (used on Railway where volumes
+# are not shared between services).
+if [ "${RUN_WORKER}" = "true" ] && [ "${SERVICE_TYPE}" = "web" ]; then
+    echo "→ Starting ARQ worker in background (RUN_WORKER=true)..."
+    arq app.worker.WorkerSettings &
+    sleep 2
+fi
 
 case "${SERVICE_TYPE}" in
     web)

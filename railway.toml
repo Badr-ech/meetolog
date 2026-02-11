@@ -4,7 +4,7 @@ dockerfilePath = "backend/Dockerfile"
 dockerContext = "backend"
 
 [deploy]
-startCommand = "sh start.sh"
+startCommand = "bash start-combined.sh"
 healthcheckPath = "/"
 healthcheckTimeout = 100
 restartPolicyType = "on-failure"
