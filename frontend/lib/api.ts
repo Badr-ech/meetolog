@@ -77,6 +77,18 @@ export interface ActionItem {
   due_date: string | null;
 }
 
+/**
+ * Safely parse a JSON response, returning null if the body isn't valid JSON
+ * (e.g. HTML error pages from reverse proxies returning 502/503).
+ */
+async function safeJson<T = unknown>(response: Response): Promise<T | null> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function uploadAudio(file: File): Promise<JobResponse> {
   const formData = new FormData();
   formData.append("file", file);
@@ -87,26 +99,30 @@ export async function uploadAudio(file: File): Promise<JobResponse> {
   });
 
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || "Upload failed");
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(error?.detail || `Upload failed (HTTP ${response.status})`);
   }
 
   return response.json();
 }
 
 export async function getJobStatus(jobId: string): Promise<JobResponse> {
-  const response = await fetch(`${API_BASE}/status/${jobId}`);
+  const response = await fetch(`${BACKEND_DIRECT}/status/${jobId}`);
 
   if (!response.ok) {
-    const error = await response.json();
-    throw new Error(error.detail || "Failed to get status");
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(error?.detail || `Failed to get status (HTTP ${response.status})`);
   }
 
-  return response.json();
+  const data = await safeJson<JobResponse>(response);
+  if (!data) {
+    throw new Error("Invalid response from server");
+  }
+  return data;
 }
 
 export function getPdfDownloadUrl(jobId: string): string {
-  return `${API_BASE}/download/${jobId}`;
+  return `${BACKEND_DIRECT}/download/${jobId}`;
 }
 
 export function pollJobStatus(
@@ -115,21 +131,43 @@ export function pollJobStatus(
   intervalMs: number = 1000
 ): () => void {
   let active = true;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 30; // Stop after 30 consecutive failures (~30s)
 
   const poll = async () => {
     while (active) {
       try {
         const status = await getJobStatus(jobId);
+        consecutiveErrors = 0; // Reset on success
         onUpdate(status);
 
         if (status.status === "completed" || status.status === "failed") {
           break;
         }
       } catch (error) {
-        console.error("Polling error:", error);
+        consecutiveErrors++;
+        console.error(`Polling error (${consecutiveErrors}/${MAX_CONSECUTIVE_ERRORS}):`, error);
+
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          // Backend is likely down for good — report failure to UI
+          onUpdate({
+            job_id: jobId,
+            status: "failed",
+            message: "Lost connection to server",
+            progress: 0,
+            artifacts: null,
+            pdf_url: null,
+            error: "Could not reach the server. The backend may have restarted — please try uploading again.",
+          });
+          break;
+        }
       }
 
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+      // Back off slightly on errors: 1s normally, up to 3s during errors
+      const delay = consecutiveErrors > 0
+        ? Math.min(intervalMs * (1 + consecutiveErrors * 0.5), 3000)
+        : intervalMs;
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
   };
 
