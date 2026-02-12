@@ -1,7 +1,7 @@
 # =============================================================================
 # Meetolog – Local Production-Like Stack
 #
-# Mirrors the Railway/Render deployment:
+# Mirrors the Render deployment:
 #   - Redis           (shared state + job queue)
 #   - Backend API     (FastAPI, SERVICE_TYPE=web)
 #   - Backend Worker  (ARQ,     SERVICE_TYPE=worker)

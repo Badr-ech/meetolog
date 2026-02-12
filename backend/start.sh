@@ -20,8 +20,8 @@ echo " Meetolog – Starting service: ${SERVICE_TYPE}"
 echo "=========================================="
 
 # If RUN_WORKER=true, start the ARQ worker in the background
-# alongside the main service (used on Railway where volumes
-# are not shared between services).
+# alongside the main service (used on Render where the API
+# and worker share a single persistent disk).
 if [ "${RUN_WORKER}" = "true" ] && [ "${SERVICE_TYPE}" = "web" ]; then
     echo "→ Starting ARQ worker in background (RUN_WORKER=true)..."
     arq app.worker.WorkerSettings &

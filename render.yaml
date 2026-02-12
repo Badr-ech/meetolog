@@ -1,0 +1,76 @@
+# =============================================================================
+# Meetolog – Render Blueprint (Infrastructure as Code)
+#
+# Deploy with: "New" → "Blueprint" → connect this repo on Render dashboard.
+# Render reads this file to create all services automatically.
+#
+# Services:
+#   - meetolog-api    (Web Service)  – FastAPI + ARQ worker in one container
+#   - meetolog-redis  (Redis)        – Managed Redis instance
+#
+# Current configuration: FREE TIER (demo/testing only)
+# - No persistent disk (files lost on restart)
+# - Services spin down after 15 min idle
+#
+# To upgrade to production (persistent storage):
+# 1. Change both "plan: free" to "plan: starter"
+# 2. Uncomment the "disk:" section below
+# 3. Total cost: $14/mo ($7 web service + $7 Redis)
+#
+# Docs: https://docs.render.com/blueprint-spec
+# =============================================================================
+
+services:
+  # ---------------------------------------------------------------------------
+  # Backend API + Worker (single container with RUN_WORKER=true)
+  # ---------------------------------------------------------------------------
+  - type: web
+    name: meetolog-api
+    runtime: docker
+    repo: https://github.com/Badr-ech/meetolog 
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free  # Free tier - NOTE: No persistent disk (files lost on restart)
+    healthCheckPath: /
+    envVars:
+      - key: SERVICE_TYPE
+        value: web
+      - key: RUN_WORKER
+        value: "true"
+      - key: PORT
+        value: "8000"
+      - key: REDIS_URL
+        fromService:
+          name: meetolog-redis
+          type: redis
+          property: connectionString
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false  # Prompt user to enter manually
+      - key: TEST_MODE
+        value: "false"
+      - key: UPLOAD_DIR
+        value: /app/data/uploads
+      - key: OUTPUT_DIR
+        value: /app/data/outputs
+      - key: CORS_ORIGINS
+        value: https://meetolog.vercel.app
+    # NOTE: Disk removed - free tier does not support persistent storage
+    # Uploaded files and PDFs will be lost on every deploy/restart
+    #
+    # To enable persistent storage (requires Starter plan or higher):
+    # Uncomment the lines below and change plan to "starter" above
+    # disk:
+    #   name: meetolog-data
+    #   mountPath: /app/data
+    #   sizeGB: 10
+
+  # ---------------------------------------------------------------------------
+  # Redis – Managed instance
+  # ---------------------------------------------------------------------------
+  - type: redis
+    name: meetolog-redis
+    plan: free  # Free tier (25MB RAM, 30 day expiration on idle)
+    maxmemoryPolicy: noeviction
+    ipAllowList: []  # Only internal access

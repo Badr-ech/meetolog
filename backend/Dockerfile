@@ -1,5 +1,5 @@
 # =============================================================================
-# Meetolog Backend – Production Dockerfile (Optimized for Railway Free Tier)
+# Meetolog Backend – Production Dockerfile (Optimized for Render)
 # Supports both the FastAPI web server and the ARQ background worker
 # via the SERVICE_TYPE environment variable.
 #

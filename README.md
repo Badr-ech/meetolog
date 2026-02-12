@@ -324,7 +324,7 @@ The backend uses ARQ (Async Redis Queue) for non-blocking audio processing. Jobs
 The frontend uses Next.js rewrites in `next.config.js` to proxy API calls, avoiding CORS issues. The backend URL is configurable via `NEXT_PUBLIC_API_URL`.
 
 ### Deployment
-See [DEPLOYMENT.md](DEPLOYMENT.md) for a full step-by-step runbook (Railway + Vercel) and [ENVIRONMENT.md](ENVIRONMENT.md) for the complete environment variable reference.
+See [DEPLOYMENT.md](DEPLOYMENT.md) for a full step-by-step runbook (Render + Vercel) and [ENVIRONMENT.md](ENVIRONMENT.md) for the complete environment variable reference.
 
 ---
 
