@@ -288,6 +288,7 @@ async def startup(ctx: dict) -> None:
     Called once when the worker starts. Sets up:
     - Redis connection pool
     - Job store instance
+    - Zombie job recovery with resumability
     - Logging configuration
     """
     logger.info("🚀 ARQ Worker starting up...")
@@ -297,7 +298,68 @@ async def startup(ctx: dict) -> None:
     ctx["redis"] = redis
     
     # Initialize job store
-    ctx["job_store"] = RedisJobStore(redis)
+    job_store = RedisJobStore(redis)
+    ctx["job_store"] = job_store
+    
+    # Recover zombie jobs (jobs interrupted by restart)
+    try:
+        from arq import create_pool
+        
+        stale_jobs = await job_store.find_stale_jobs()
+        
+        if not stale_jobs:
+            logger.info("✅ No stale jobs found")
+        else:
+            logger.warning(f"🧟 Found {len(stale_jobs)} stale job(s), attempting recovery...")
+            
+            # Get ARQ pool for re-queuing
+            arq_pool = await create_pool(get_arq_redis_settings())
+            
+            resumed = 0
+            failed = 0
+            
+            for job_id, metadata in stale_jobs:
+                # Check if job has cached progress (can be resumed)
+                has_progress = (
+                    metadata["has_transcript"] == "1" or 
+                    metadata["has_artifacts"] == "1"
+                )
+                
+                if has_progress:
+                    # Re-queue the job to resume processing
+                    try:
+                        await arq_pool.enqueue_job(
+                            "process_audio_job",
+                            job_id,
+                            metadata["file_path"],
+                            metadata["file_name"],
+                            metadata["file_size"],
+                        )
+                        resumed += 1
+                        logger.info(f"✅ Re-queued job {job_id} for resumption (has cached progress)")
+                    except Exception as e:
+                        logger.error(f"Failed to re-queue job {job_id}: {e}")
+                        await job_store.mark_job_failed(
+                            UUID(job_id),
+                            f"Failed to resume after restart: {e}"
+                        )
+                        failed += 1
+                else:
+                    # No cached progress, mark as failed
+                    await job_store.mark_job_failed(
+                        UUID(job_id),
+                        "Job interrupted by server restart. Please re-upload your file."
+                    )
+                    failed += 1
+                    logger.warning(f"❌ Marked job {job_id} as failed (no cached progress to resume)")
+            
+            await arq_pool.close()
+            
+            logger.info(
+                f"🔄 Recovery complete: {resumed} resumed, {failed} failed"
+            )
+    except Exception as e:
+        logger.error(f"Failed to recover zombie jobs: {e}")
     
     logger.info("✅ Worker startup complete")
 

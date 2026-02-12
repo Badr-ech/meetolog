@@ -399,3 +399,100 @@ class RedisJobStore(JobStore):
         """
         redis = await self._get_redis()
         return await redis.hget(self._job_key(job_id), "file_path")
+    
+    async def get_job_metadata(self, job_id: UUID) -> dict | None:
+        """
+        Get file metadata needed to re-queue a job.
+        
+        Args:
+            job_id: The job identifier
+            
+        Returns:
+            Dict with file_path, file_name, file_size or None if not found
+        """
+        redis = await self._get_redis()
+        key = self._job_key(job_id)
+        
+        data = await redis.hmget(
+            key,
+            "file_path",
+            "file_name",
+            "file_size",
+            "status",
+            "has_transcript",
+            "has_artifacts"
+        )
+        
+        if not data[0]:  # file_path is required
+            return None
+        
+        return {
+            "file_path": data[0].decode() if isinstance(data[0], bytes) else data[0],
+            "file_name": data[1].decode() if isinstance(data[1], bytes) else data[1],
+            "file_size": int(data[2]) if data[2] else 0,
+            "status": data[3].decode() if isinstance(data[3], bytes) else data[3],
+            "has_transcript": data[4].decode() if isinstance(data[4], bytes) else "0",
+            "has_artifacts": data[5].decode() if isinstance(data[5], bytes) else "0",
+        }
+    
+    async def find_stale_jobs(self) -> list[tuple[str, dict]]:
+        """
+        Scan Redis for in-progress jobs that may need recovery.
+        
+        Returns:
+            List of (job_id, metadata) tuples for jobs in processing states
+        """
+        redis = await self._get_redis()
+        stale_jobs = []
+        
+        # Scan for all job keys
+        cursor = 0
+        while True:
+            cursor, keys = await redis.scan(
+                cursor=cursor,
+                match="job:*",
+                count=100
+            )
+            
+            for key in keys:
+                # Skip non-hash keys (transcript/artifacts)
+                key_str = key.decode() if isinstance(key, bytes) else key
+                if ":" in key_str.split("job:")[-1]:  # Has suffix like :transcript
+                    continue
+                
+                # Extract job_id from key
+                job_id = key_str.replace("job:", "")
+                
+                # Get job metadata
+                try:
+                    metadata = await self.get_job_metadata(UUID(job_id))
+                    if metadata and metadata["status"] in ["transcribing", "extracting", "generating_pdf"]:
+                        stale_jobs.append((job_id, metadata))
+                except Exception as e:
+                    logger.error(f"Failed to parse job {key_str}: {e}")
+                    continue
+            
+            if cursor == 0:
+                break
+        
+        return stale_jobs
+    
+    async def mark_job_failed(self, job_id: UUID, error_message: str) -> None:
+        """
+        Mark a specific job as failed with an error message.
+        
+        Args:
+            job_id: The job identifier
+            error_message: Error message to store
+        """
+        redis = await self._get_redis()
+        now = self._now_iso()
+        await redis.hset(
+            self._job_key(job_id),
+            mapping={
+                "status": "failed",
+                "error": error_message,
+                "updated_at": now,
+                "completed_at": now,
+            }
+        )
