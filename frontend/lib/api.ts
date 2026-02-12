@@ -107,7 +107,8 @@ export async function uploadAudio(file: File): Promise<JobResponse> {
 }
 
 export async function getJobStatus(jobId: string): Promise<JobResponse> {
-  const response = await fetch(`${BACKEND_DIRECT}/status/${jobId}`);
+  // Use Vercel proxy to avoid CORS issues when backend is down (502/503 don't include CORS headers)
+  const response = await fetch(`${API_BASE}/status/${jobId}`);
 
   if (!response.ok) {
     const error = await safeJson<{ detail?: string }>(response);
