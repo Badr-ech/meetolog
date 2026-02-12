@@ -48,6 +48,11 @@ RUN pip install --no-cache-dir /wheels/* \
     && rm -rf /wheels \
     && pip cache purge
 
+# Pre-download Whisper model into image so it's available instantly
+# at runtime (avoids 139MB download on every cold start)
+RUN python -c "import whisper; whisper.load_model('tiny')" \
+    && rm -rf /tmp/*
+
 # Copy application code
 COPY . .
 

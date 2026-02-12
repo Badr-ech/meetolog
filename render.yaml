@@ -50,6 +50,8 @@ services:
         sync: false  # Prompt user to enter manually
       - key: TEST_MODE
         value: "false"
+      - key: WHISPER_MODEL
+        value: tiny
       - key: UPLOAD_DIR
         value: /app/data/uploads
       - key: OUTPUT_DIR

@@ -361,6 +361,19 @@ async def startup(ctx: dict) -> None:
     except Exception as e:
         logger.error(f"Failed to recover zombie jobs: {e}")
     
+    # Pre-warm the Whisper model into memory so the first job
+    # doesn't waste time loading it (saves ~2-3s per cold start)
+    settings = get_settings()
+    if not settings.test_mode:
+        try:
+            logger.info(f"🔊 Pre-warming Whisper model: {settings.whisper_model}")
+            from app.services.transcription import _get_cached_model
+            import asyncio
+            await asyncio.to_thread(_get_cached_model, settings.whisper_model)
+            logger.info("🔊 Whisper model ready")
+        except Exception as e:
+            logger.warning(f"Failed to pre-warm Whisper model (will load on first job): {e}")
+    
     logger.info("✅ Worker startup complete")
 
 

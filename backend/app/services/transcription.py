@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 
 # Lazy import whisper to allow mock mode without whisper installed
 _whisper = None
+# Singleton model cache: keeps the loaded model in memory across jobs
+# so we don't reload from disk (~2-3s) on every transcription request
+_model_cache: dict[str, object] = {}
 
 
 def _get_whisper():
@@ -32,19 +35,23 @@ def _get_whisper():
     return _whisper
 
 
+def _get_cached_model(model_name: str):
+    """Load and cache a Whisper model. Subsequent calls return the cached instance."""
+    if model_name not in _model_cache:
+        whisper = _get_whisper()
+        logger.info(f"Loading Whisper model: {model_name}")
+        _model_cache[model_name] = whisper.load_model(model_name)
+        logger.info(f"Whisper model '{model_name}' loaded and cached")
+    return _model_cache[model_name]
+
+
 class WhisperTranscriber(Transcriber):
     def __init__(self, model_name: str = "base"):
         self._model_name = model_name
-        self._model = None
         logger.info(f"WhisperTranscriber initialized with model: {model_name}")
     
     def _load_model(self):
-        if self._model is None:
-            whisper = _get_whisper()
-            logger.info(f"Loading Whisper model: {self._model_name}")
-            self._model = whisper.load_model(self._model_name)
-            logger.info("Whisper model loaded successfully")
-        return self._model
+        return _get_cached_model(self._model_name)
     
     def _transcribe_sync(self, audio_path: Path) -> str:
         model = self._load_model()

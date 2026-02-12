@@ -58,8 +58,8 @@ class Settings(BaseSettings):
     )
     
     whisper_model: Literal["tiny", "base", "small", "medium", "large"] = Field(
-        default="base",
-        description="Whisper model size. 'base' is recommended for MVP."
+        default="tiny",
+        description="Whisper model size. 'tiny' for free tier, 'base' for better accuracy."
     )
     
     # ==========================================================================
