@@ -24,7 +24,9 @@ Usage:
 import asyncio
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from uuid import UUID
@@ -127,7 +129,7 @@ async def process_audio_job(
     
     try:
         # =====================================================================
-        # Stage 1: Transcription (10-40%)
+        # Stage 1: Transcription (10-40%) — chunked for restart resilience
         # =====================================================================
         logger.info(f"[{job_id}] Stage 1: Transcription starting")
         
@@ -138,24 +140,118 @@ async def process_audio_job(
             message="Transcribing audio...",
         )
         
-        # Check for cached transcript (resumability)
+        # Check for cached full transcript (resumability from prior run)
         transcript = await job_store.get_cached_transcript(job_uuid)
         
         if transcript:
             logger.info(f"[{job_id}] Using cached transcript (resuming)")
         else:
-            # Check if audio file exists
-            if not audio_path.exists():
-                raise FileNotFoundError(f"Audio file not found: {audio_path}")
+            # -----------------------------------------------------------------
+            # Resolve audio source: local file or Redis-stored compressed audio
+            # -----------------------------------------------------------------
+            work_dir = Path(tempfile.mkdtemp(prefix=f"meetolog_{job_id}_"))
             
-            # Run transcription
-            transcriber = get_transcriber()
-            raw_transcript = await transcriber.transcribe(audio_path)
-            transcript = await transcriber.preprocess_transcript(raw_transcript)
-            
-            # Cache transcript for resumability
-            await job_store.cache_transcript(job_uuid, transcript)
-            logger.info(f"[{job_id}] Transcript cached for resumability")
+            try:
+                if audio_path.exists():
+                    # Fresh job — audio file is on disk
+                    effective_audio = audio_path
+                    
+                    # Compress & store in Redis for restart resilience
+                    try:
+                        from app.services.transcription import compress_audio_for_storage
+                        
+                        logger.info(f"[{job_id}] Compressing audio for Redis backup...")
+                        compressed = await asyncio.to_thread(
+                            compress_audio_for_storage, audio_path
+                        )
+                        stored = await job_store.store_audio(job_uuid, compressed)
+                        if stored:
+                            logger.info(f"[{job_id}] Audio backed up to Redis")
+                        else:
+                            logger.warning(f"[{job_id}] Audio too large for Redis backup")
+                    except Exception as e:
+                        logger.warning(f"[{job_id}] Failed to backup audio to Redis: {e}")
+                else:
+                    # Resumed job — try to restore from Redis
+                    stored_audio = await job_store.get_stored_audio(job_uuid)
+                    if stored_audio is None:
+                        raise FileNotFoundError(
+                            f"Audio file not found on disk or in Redis: {audio_path}"
+                        )
+                    
+                    logger.info(f"[{job_id}] Restoring audio from Redis backup...")
+                    from app.services.transcription import decompress_audio
+                    
+                    restored_path = work_dir / "restored_audio.wav"
+                    await asyncio.to_thread(
+                        decompress_audio, stored_audio, restored_path
+                    )
+                    effective_audio = restored_path
+                    logger.info(f"[{job_id}] Audio restored from Redis")
+                
+                # -----------------------------------------------------------------
+                # Split into chunks and transcribe incrementally
+                # -----------------------------------------------------------------
+                from app.services.transcription import (
+                    split_audio_into_chunks,
+                    get_audio_duration,
+                )
+                
+                chunk_dir = work_dir / "chunks"
+                chunks = await asyncio.to_thread(
+                    split_audio_into_chunks, effective_audio, chunk_dir
+                )
+                total_chunks = len(chunks)
+                logger.info(f"[{job_id}] Audio split into {total_chunks} chunks")
+                
+                # Check which chunks were already transcribed (prior partial run)
+                completed_indices, _ = await job_store.get_completed_chunk_indices(job_uuid)
+                
+                if completed_indices:
+                    logger.info(
+                        f"[{job_id}] Resuming: {len(completed_indices)}/{total_chunks} "
+                        f"chunks already done"
+                    )
+                
+                # Transcribe remaining chunks
+                transcriber = get_transcriber()
+                
+                for i, chunk_path in enumerate(chunks):
+                    if i in completed_indices:
+                        continue
+                    
+                    # Progress: spread 10-38% across chunks
+                    chunk_progress = 10 + int(28 * (i / total_chunks))
+                    await job_store.update(
+                        job_uuid,
+                        progress=chunk_progress,
+                        message=f"Transcribing chunk {i + 1}/{total_chunks}...",
+                    )
+                    
+                    chunk_text = await transcriber.transcribe_chunk(chunk_path)
+                    chunk_text = await transcriber.preprocess_transcript(chunk_text)
+
+                    # Cache immediately — survives restarts
+                    await job_store.save_chunk_transcript(
+                        job_uuid, i, chunk_text, total_chunks
+                    )
+                    logger.info(
+                        f"[{job_id}] Chunk {i + 1}/{total_chunks} transcribed and cached"
+                    )
+                
+                # Assemble full transcript from all chunks
+                transcript = await job_store.assemble_transcript_from_chunks(job_uuid)
+                if not transcript:
+                    raise RuntimeError("Failed to assemble transcript from chunks")
+                
+                # Cache the full transcript and clean up chunk/audio data
+                await job_store.cache_transcript(job_uuid, transcript)
+                await job_store.delete_chunk_data(job_uuid)
+                logger.info(f"[{job_id}] Full transcript cached, chunk data cleaned up")
+                
+            finally:
+                # Clean up temp directory
+                shutil.rmtree(work_dir, ignore_errors=True)
         
         await job_store.update(
             job_uuid,
@@ -319,13 +415,18 @@ async def startup(ctx: dict) -> None:
             failed = 0
             
             for job_id, metadata in stale_jobs:
-                # Check if job has cached progress (can be resumed)
+                # A job is resumable if it has:
+                # 1. A full cached transcript or artifacts (existing logic), OR
+                # 2. Audio stored in Redis (can re-transcribe from chunks)
                 has_progress = (
                     metadata["has_transcript"] == "1" or 
                     metadata["has_artifacts"] == "1"
                 )
+                has_audio = metadata.get("has_audio") == "1"
                 
-                if has_progress:
+                can_resume = has_progress or has_audio
+                
+                if can_resume:
                     # Re-queue the job to resume processing
                     try:
                         await arq_pool.enqueue_job(
@@ -336,7 +437,15 @@ async def startup(ctx: dict) -> None:
                             metadata["file_size"],
                         )
                         resumed += 1
-                        logger.info(f"✅ Re-queued job {job_id} for resumption (has cached progress)")
+                        resume_reason = []
+                        if has_progress:
+                            resume_reason.append("cached progress")
+                        if has_audio:
+                            resume_reason.append("stored audio")
+                        logger.info(
+                            f"✅ Re-queued job {job_id} for resumption "
+                            f"({', '.join(resume_reason)})"
+                        )
                     except Exception as e:
                         logger.error(f"Failed to re-queue job {job_id}: {e}")
                         await job_store.mark_job_failed(
@@ -345,13 +454,13 @@ async def startup(ctx: dict) -> None:
                         )
                         failed += 1
                 else:
-                    # No cached progress, mark as failed
+                    # No cached progress and no stored audio — unrecoverable
                     await job_store.mark_job_failed(
                         UUID(job_id),
                         "Job interrupted by server restart. Please re-upload your file."
                     )
                     failed += 1
-                    logger.warning(f"❌ Marked job {job_id} as failed (no cached progress to resume)")
+                    logger.warning(f"❌ Marked job {job_id} as failed (no cached progress or audio)")
             
             await arq_pool.close()
             

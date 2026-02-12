@@ -13,6 +13,8 @@ Redis Key Schema:
 - job:{uuid}           - Hash with job metadata
 - job:{uuid}:transcript - String with cached transcript
 - job:{uuid}:artifacts  - JSON string with extracted artifacts
+- job:{uuid}:audio      - Compressed audio bytes (for restart resilience)
+- job:{uuid}:chunks     - Hash mapping chunk_index → transcript text
 
 See TECHNICAL_DESIGN_V2.md Section 2 for full schema details.
 """
@@ -64,6 +66,14 @@ class RedisJobStore(JobStore):
     @staticmethod
     def _artifacts_key(job_id: UUID | str) -> str:
         return f"job:{job_id}:artifacts"
+    
+    @staticmethod
+    def _audio_key(job_id: UUID | str) -> str:
+        return f"job:{job_id}:audio"
+    
+    @staticmethod
+    def _chunks_key(job_id: UUID | str) -> str:
+        return f"job:{job_id}:chunks"
     
     def _get_ttl(self, status: ProcessingStatus) -> int:
         if status == ProcessingStatus.FAILED:
@@ -279,6 +289,8 @@ class RedisJobStore(JobStore):
             self._job_key(job_id),
             self._transcript_key(job_id),
             self._artifacts_key(job_id),
+            self._audio_key(job_id),
+            self._chunks_key(job_id),
         ]
         
         deleted = await redis.delete(*keys_to_delete)
@@ -420,7 +432,8 @@ class RedisJobStore(JobStore):
             "file_size",
             "status",
             "has_transcript",
-            "has_artifacts"
+            "has_artifacts",
+            "has_audio"
         )
         
         if not data[0]:  # file_path is required
@@ -433,6 +446,7 @@ class RedisJobStore(JobStore):
             "status": data[3].decode() if isinstance(data[3], bytes) else data[3],
             "has_transcript": data[4].decode() if isinstance(data[4], bytes) else "0",
             "has_artifacts": data[5].decode() if isinstance(data[5], bytes) else "0",
+            "has_audio": data[6].decode() if isinstance(data[6], bytes) else "0",
         }
     
     async def find_stale_jobs(self) -> list[tuple[str, dict]]:
@@ -496,3 +510,152 @@ class RedisJobStore(JobStore):
                 "completed_at": now,
             }
         )
+    
+    # =========================================================================
+    # Audio Storage (for restart resilience)
+    # =========================================================================
+    
+    async def store_audio(self, job_id: UUID, audio_bytes: bytes) -> bool:
+        """
+        Store compressed audio in Redis for resilience across restarts.
+        
+        On Render free tier there's no persistent disk, so the uploaded
+        audio file is lost when the container restarts. Storing a compressed
+        copy in Redis lets us resume transcription after a restart.
+        
+        Args:
+            job_id: The job identifier
+            audio_bytes: Compressed audio data
+            
+        Returns:
+            True if stored, False if too large
+        """
+        # Safety: don't store audio > 15MB to avoid filling Redis
+        max_audio_bytes = 15 * 1024 * 1024
+        if len(audio_bytes) > max_audio_bytes:
+            logger.warning(
+                f"Audio too large for Redis storage: {len(audio_bytes) / 1024 / 1024:.1f}MB "
+                f"(limit: {max_audio_bytes / 1024 / 1024:.0f}MB)"
+            )
+            return False
+        
+        redis = await self._get_redis()
+        
+        async with redis.pipeline() as pipe:
+            pipe.set(self._audio_key(job_id), audio_bytes)
+            pipe.expire(self._audio_key(job_id), self._ttl_seconds)
+            pipe.hset(self._job_key(job_id), "has_audio", "1")
+            await pipe.execute()
+        
+        logger.info(
+            f"Audio stored in Redis for job {job_id}: {len(audio_bytes) / 1024 / 1024:.1f}MB"
+        )
+        return True
+    
+    async def get_stored_audio(self, job_id: UUID) -> bytes | None:
+        """
+        Retrieve stored compressed audio from Redis.
+        
+        Args:
+            job_id: The job identifier
+            
+        Returns:
+            Compressed audio bytes or None if not stored
+        """
+        redis = await self._get_redis()
+        return await redis.get(self._audio_key(job_id))
+    
+    async def delete_stored_audio(self, job_id: UUID) -> None:
+        """Delete stored audio to free Redis memory after transcription completes."""
+        redis = await self._get_redis()
+        await redis.delete(self._audio_key(job_id))
+        logger.debug(f"Stored audio deleted for job {job_id}")
+    
+    # =========================================================================
+    # Chunk Transcript Storage (for incremental transcription)
+    # =========================================================================
+    
+    async def save_chunk_transcript(
+        self, job_id: UUID, chunk_index: int, text: str, total_chunks: int
+    ) -> None:
+        """
+        Save a single chunk's transcript. Called after each chunk completes.
+        
+        Args:
+            job_id: The job identifier
+            chunk_index: Zero-based index of the chunk
+            text: Transcript text for this chunk
+            total_chunks: Total number of chunks to process
+        """
+        redis = await self._get_redis()
+        key = self._chunks_key(job_id)
+        
+        async with redis.pipeline() as pipe:
+            pipe.hset(key, str(chunk_index), text)
+            pipe.hset(key, "__total__", str(total_chunks))
+            pipe.expire(key, self._ttl_seconds)
+            await pipe.execute()
+        
+        logger.debug(f"Chunk {chunk_index + 1}/{total_chunks} transcript saved for job {job_id}")
+    
+    async def get_completed_chunk_indices(self, job_id: UUID) -> tuple[set[int], int]:
+        """
+        Get which chunks have been transcribed and the total count.
+        
+        Returns:
+            Tuple of (set of completed chunk indices, total chunks).
+            Returns (empty set, 0) if no chunk data exists.
+        """
+        redis = await self._get_redis()
+        key = self._chunks_key(job_id)
+        
+        data = await redis.hgetall(key)
+        if not data:
+            return set(), 0
+        
+        total = int(data.get(b"__total__", data.get("__total__", 0)))
+        completed = set()
+        
+        for k in data:
+            k_str = k.decode() if isinstance(k, bytes) else k
+            if k_str != "__total__":
+                completed.add(int(k_str))
+        
+        return completed, total
+    
+    async def assemble_transcript_from_chunks(self, job_id: UUID) -> str | None:
+        """
+        Combine all chunk transcripts into a single transcript, ordered by index.
+        
+        Returns:
+            Combined transcript string, or None if chunks are missing
+        """
+        redis = await self._get_redis()
+        key = self._chunks_key(job_id)
+        
+        data = await redis.hgetall(key)
+        if not data:
+            return None
+        
+        total = int(data.get(b"__total__", data.get("__total__", 0)))
+        
+        parts = []
+        for i in range(total):
+            i_key = str(i).encode()
+            text = data.get(i_key, data.get(str(i)))
+            if text is None:
+                logger.error(f"Missing chunk {i} for job {job_id}")
+                return None
+            if isinstance(text, bytes):
+                text = text.decode()
+            parts.append(text)
+        
+        return " ".join(parts)
+    
+    async def delete_chunk_data(self, job_id: UUID) -> None:
+        """Delete chunk data and stored audio after transcription completes."""
+        redis = await self._get_redis()
+        await redis.delete(self._chunks_key(job_id), self._audio_key(job_id))
+        # Clear the has_audio flag
+        await redis.hdel(self._job_key(job_id), "has_audio")
+        logger.debug(f"Chunk/audio data cleaned up for job {job_id}")
