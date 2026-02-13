@@ -1,0 +1,188 @@
+.recorder {
+  max-width: 600px;
+  margin: 0 auto 2rem;
+}
+
+/* Mode Tabs */
+.tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 1.5rem;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.tab {
+  flex: 1;
+  padding: 0.75rem 1rem;
+  background: none;
+  border: none;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #6b7280;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+}
+
+.tab:hover {
+  color: #374151;
+}
+
+.tabActive {
+  color: #2563eb;
+  border-bottom-color: #2563eb;
+  font-weight: 600;
+}
+
+/* Record Mode */
+.recordArea {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.25rem;
+  padding: 1.5rem 0;
+}
+
+.permissionPrompt {
+  text-align: center;
+  color: #6b7280;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+.permissionBtn {
+  margin-top: 0.75rem;
+  padding: 0.6rem 1.25rem;
+  background: #2563eb;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.permissionBtn:hover {
+  background: #1d4ed8;
+}
+
+.permissionDenied {
+  color: #991b1b;
+  text-align: center;
+  font-size: 0.9rem;
+}
+
+/* Visualizer */
+.visualizer {
+  width: 100%;
+  height: 64px;
+  border-radius: 8px;
+  background: #f9fafb;
+}
+
+/* Record Button */
+.recordBtn {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  border: 3px solid #dc2626;
+  background: transparent;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  position: relative;
+}
+
+.recordBtn:hover {
+  background: rgba(220, 38, 38, 0.05);
+}
+
+.recordIcon {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: #dc2626;
+  transition: all 0.15s;
+}
+
+.recordIconStop {
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+}
+
+.timer {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: #374151;
+  font-variant-numeric: tabular-nums;
+}
+
+.recordingLabel {
+  font-size: 0.85rem;
+  color: #dc2626;
+  font-weight: 500;
+}
+
+/* Upload Mode */
+.dropzone {
+  position: relative;
+  border: 2px dashed #d1d5db;
+  border-radius: 12px;
+  padding: 2rem;
+  text-align: center;
+  transition: all 0.15s;
+  cursor: pointer;
+}
+
+.dropzone:hover {
+  border-color: #2563eb;
+  background: #f0f9ff;
+}
+
+.fileInput {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.dropzoneLabel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  color: #6b7280;
+  pointer-events: none;
+}
+
+.dropzoneIcon {
+  font-size: 2rem;
+  line-height: 1;
+}
+
+.fileName {
+  font-weight: 600;
+  color: #2563eb;
+}
+
+.hint {
+  font-size: 0.8rem;
+  color: #9ca3af;
+}
+
+/* Shared Controls */
+.submitBtn {
+  width: 100%;
+  margin-top: 1rem;
+}
+
+.converting {
+  text-align: center;
+  font-size: 0.85rem;
+  color: #6b7280;
+  margin-top: 0.5rem;
+}

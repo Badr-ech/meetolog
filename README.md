@@ -2,10 +2,10 @@
 
 Transform meeting audio recordings into structured Agile artifacts using AI-powered semantic extraction.
 
-## 🎯 Overview
+## Overview
 
 Meetolog is an MVP system that:
-1. **Accepts** audio uploads (MP3, WAV, M4A, OGG, WebM)
+1. **Accepts** audio uploads (MP3, WAV, M4A, OGG, WebM) or in-browser microphone recordings
 2. **Transcribes** speech to text using OpenAI Whisper (local model)
 3. **Extracts** Agile artifacts using Google Gemini LLM:
    - User Stories (with acceptance criteria)
@@ -13,12 +13,12 @@ Meetolog is an MVP system that:
    - Decisions (with rationale)
    - Blockers (with resolution plans)
    - Action Items
-   - **Execution Tasks** – AI-inferred actionable work items derived from explicit statements *and* logical implications of decisions/blockers, with owner roles, priorities, and dependency tracking
+   - Execution Tasks — AI-inferred actionable work items derived from explicit statements and logical implications, with owner roles, priorities, and dependency tracking
 4. **Generates** a downloadable PDF summary (including a dedicated Execution Tasks page)
 
 ---
 
-## ⚠️ Deployment Constraints (IMPORTANT)
+## Deployment Constraints
 
 ### 1. Single Instance Only
 This MVP **must run as a single instance** (no horizontal scaling). The application uses:
@@ -56,7 +56,7 @@ The following must be installed on the host system:
 
 ---
 
-## 🔧 Environment Variables
+## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
@@ -91,61 +91,53 @@ In test mode:
 
 ---
 
-## 🏗️ Project Structure
+## Project Structure
 
 ```
 meetolog/
 ├── backend/
 │   ├── app/
-│   │   ├── __init__.py
-│   │   ├── main.py              # FastAPI entry point & endpoints
+│   │   ├── main.py              # FastAPI entry point
 │   │   ├── config.py            # Environment configuration
-│   │   ├── models.py            # Pydantic models (incl. ActionableTask)
-│   │   ├── interfaces.py        # Abstract base classes (JobStore, Transcriber, LLMExtractor)
+│   │   ├── models.py            # Pydantic models
+│   │   ├── interfaces.py        # Abstract base classes
 │   │   ├── dependencies.py      # Factory pattern & dependency injection
 │   │   ├── worker.py            # Background job processing
-│   │   ├── load_dataset.py      # Dataset loading utilities
 │   │   ├── infrastructure/
-│   │   │   ├── __init__.py
-│   │   │   ├── job_store.py     # Job persistence infrastructure
-│   │   │   └── redis.py         # Redis connection management
+│   │   │   ├── job_store.py     # Job persistence
+│   │   │   └── redis.py         # Redis connection
 │   │   └── services/
-│   │       ├── __init__.py
-│   │       ├── transcription.py    # WhisperTranscriber (production)
-│   │       ├── llm_extraction.py   # GeminiExtractor + Task Inference Protocol
+│   │       ├── transcription.py    # WhisperTranscriber
+│   │       ├── llm_extraction.py   # GeminiExtractor
 │   │       ├── llm_engine.py       # LLM engine abstraction
-│   │       ├── pdf_generator.py    # ReportLab PDF generation (incl. Execution Tasks)
-│   │       ├── job_store.py        # LocalJobStore (in-memory + file backup)
-│   │       └── mock_services.py    # MockTranscriber & MockExtractor (testing)
+│   │       ├── pdf_generator.py    # ReportLab PDF generation
+│   │       ├── job_store.py        # LocalJobStore
+│   │       └── mock_services.py    # Mock services for testing
 │   ├── requirements.txt
-│   ├── dataset_audio/           # Sample audio files
-│   ├── outputs/                 # Generated PDFs and job state
-│   ├── uploads/                 # Temporary upload storage
-│   └── .env / .env.example
+│   ├── outputs/
+│   └── uploads/
 │
 ├── frontend/
 │   ├── app/
-│   │   ├── layout.tsx           # Root layout
-│   │   ├── page.tsx             # Main upload & results page
-│   │   ├── page.module.css      # Page styles
-│   │   └── globals.css          # Global styles
+│   │   ├── layout.tsx
+│   │   ├── page.tsx             # Main page
+│   │   ├── globals.css
+│   │   └── components/
+│   │       └── recorder/
+│   │           └── VoiceRecorder.tsx  # Record + Upload UI
 │   ├── lib/
-│   │   └── api.ts               # Backend API utilities
+│   │   ├── api.ts               # Backend API client
+│   │   └── audio.ts             # Client-side audio processing
 │   ├── package.json
-│   ├── next.config.js           # API rewrites for CORS
-│   └── tsconfig.json
+│   └── next.config.js
 │
-├── docs/
-│   └── TECHNICAL_DESIGN_V2.md   # Technical design document
-│
-├── AI_CONTEXT.md                # AI coding context
 ├── LICENSE
 └── README.md
 ```
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -201,7 +193,7 @@ The frontend will be available at `http://localhost:3000`
 
 ---
 
-## 📡 API Endpoints
+## API Endpoints
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -235,7 +227,7 @@ Response:
 curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 ```
 
-## 🔧 Configuration
+## Configuration
 
 ### Getting a Gemini API Key
 
@@ -247,7 +239,7 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 
 ---
 
-## 🧪 Testing the MVP
+## Testing the MVP
 
 ### With Mock Services (Recommended for First Test)
 
@@ -270,7 +262,7 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 
 ---
 
-## 📦 Key Dependencies
+## Key Dependencies
 
 ### Backend
 - **FastAPI** - Modern async web framework
@@ -290,7 +282,7 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 
 ---
 
-## 🔮 Future Enhancements
+## Future Enhancements
 
 - [ ] **User authentication** - Multi-user support
 - [ ] **PostgreSQL persistence** - Replace local file storage
@@ -302,7 +294,7 @@ curl "http://localhost:8000/status/550e8400-e29b-41d4-a716-446655440000"
 
 ---
 
-## 📝 Architecture Notes
+## Architecture Notes
 
 ### Service Abstraction Layer
 The backend uses an interface-based architecture for easy testing and future extensibility:
@@ -323,15 +315,8 @@ The backend uses ARQ (Async Redis Queue) for non-blocking audio processing. Jobs
 ### CORS Handling
 The frontend uses Next.js rewrites in `next.config.js` to proxy API calls, avoiding CORS issues. The backend URL is configurable via `NEXT_PUBLIC_API_URL`.
 
-### Deployment
-See [DEPLOYMENT.md](DEPLOYMENT.md) for a full step-by-step runbook (Render + Vercel) and [ENVIRONMENT.md](ENVIRONMENT.md) for the complete environment variable reference.
-
 ---
 
-## 📄 License
+## License
 
-This project is released under the MIT License. See the [LICENSE](LICENSE) file for the full text.
-
-Note: you indicated you will keep the repository private when publishing — that is the recommended approach
-if you plan to sell the software or keep full commercial control. The `LICENSE` file grants permission
-for others to use and redistribute the code if the repository is ever made public.
+MIT License. See [LICENSE](LICENSE).

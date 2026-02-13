@@ -2,10 +2,10 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import { uploadAudio, pollJobStatus, getPdfDownloadUrl, JobResponse, MeetingArtifacts } from "@/lib/api";
+import VoiceRecorder from "./components/recorder/VoiceRecorder";
 import styles from "./page.module.css";
 
 export default function Home() {
-  const [file, setFile] = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [job, setJob] = useState<JobResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -17,21 +17,10 @@ export default function Home() {
     };
   }, []);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      setFile(selectedFile);
-      setError(null);
-      setJob(null);
-    }
-  };
-
-  const handleSubmit = useCallback(async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!file) return;
-
+  const handleFileReady = useCallback(async (file: File) => {
     setIsUploading(true);
     setError(null);
+    setJob(null);
 
     try {
       const jobResponse = await uploadAudio(file);
@@ -48,7 +37,7 @@ export default function Home() {
     } finally {
       setIsUploading(false);
     }
-  }, [file]);
+  }, []);
 
   const isProcessing = !!(job && !["completed", "failed"].includes(job.status));
   const isCompleted = job?.status === "completed";
@@ -56,59 +45,26 @@ export default function Home() {
   return (
     <main className={styles.main}>
       <div className="container">
-        {/* Header */}
         <header className={styles.header}>
-          <h1 className={styles.title}>📋 Meetolog</h1>
+          <h1 className={styles.title}>Meetolog</h1>
           <p className={styles.subtitle}>
             Transform meeting recordings into structured Agile artifacts
           </p>
         </header>
 
-        {/* Upload Section */}
-        <section className={`card ${styles.uploadCard}`}>
-          <h2 className={styles.sectionTitle}>Upload Meeting Recording</h2>
-          
-          <form onSubmit={handleSubmit} className={styles.form}>
-            <div className={styles.dropzone}>
-              <input
-                type="file"
-                id="audio-file"
-                accept=".mp3,.wav,.m4a,.ogg,.webm"
-                onChange={handleFileChange}
-                disabled={isUploading || isProcessing}
-                className={styles.fileInput}
-              />
-              <label htmlFor="audio-file" className={styles.dropzoneLabel}>
-                <span className={styles.dropzoneIcon}>🎙️</span>
-                {file ? (
-                  <span className={styles.fileName}>{file.name}</span>
-                ) : (
-                  <>
-                    <span>Drop audio file here or click to browse</span>
-                    <span className={styles.hint}>MP3, WAV, M4A, OGG, WebM (max 100MB)</span>
-                  </>
-                )}
-              </label>
-            </div>
+        <VoiceRecorder
+          onFileReady={handleFileReady}
+          disabled={isUploading || isProcessing}
+        />
 
-            <button
-              type="submit"
-              disabled={!file || isUploading || isProcessing}
-              className="btn btn-primary"
-            >
-              {isUploading ? "Uploading..." : isProcessing ? "Processing..." : "Process Recording"}
-            </button>
-          </form>
+        {error && (
+          <div className={`card ${styles.statusCard}`}>
+            <div className={styles.error}>{error}</div>
+          </div>
+        )}
 
-          {/* Error Display */}
-          {error && (
-            <div className={styles.error}>
-              <span>⚠️</span> {error}
-            </div>
-          )}
-
-          {/* Progress Display */}
-          {job && !isCompleted && !error && (
+        {job && !isCompleted && !error && (
+          <div className={`card ${styles.statusCard}`}>
             <div className={styles.progressSection}>
               <div className={styles.progressHeader}>
                 <span className={styles.statusText}>{job.message}</span>
@@ -121,8 +77,8 @@ export default function Home() {
                 />
               </div>
             </div>
-          )}
-        </section>
+          </div>
+        )}
 
         {/* Results Section */}
         {isCompleted && job.artifacts && (
@@ -153,7 +109,7 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
             download
             className="btn btn-primary"
           >
-            📥 Download PDF
+            Download PDF
           </a>
         </div>
         {artifacts.summary && (
@@ -164,7 +120,7 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
       {/* User Stories */}
       {artifacts.user_stories.length > 0 && (
         <div className="card">
-          <h3 className={styles.artifactTitle}>📖 User Stories ({artifacts.user_stories.length})</h3>
+          <h3 className={styles.artifactTitle}>User Stories ({artifacts.user_stories.length})</h3>
           <div className={styles.artifactList}>
             {artifacts.user_stories.map((story) => (
               <div key={story.id} className={styles.storyCard}>
@@ -197,7 +153,7 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
       {/* Tasks */}
       {artifacts.tasks.length > 0 && (
         <div className="card">
-          <h3 className={styles.artifactTitle}>✅ Tasks ({artifacts.tasks.length})</h3>
+          <h3 className={styles.artifactTitle}>Tasks ({artifacts.tasks.length})</h3>
           <div className={styles.taskList}>
             {artifacts.tasks.map((task) => (
               <div key={task.id} className={styles.taskCard}>
@@ -209,8 +165,8 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
                   <p className={styles.taskDesc}>{task.description}</p>
                 )}
                 <div className={styles.taskMeta}>
-                  {task.assignee && <span>👤 {task.assignee}</span>}
-                  {task.due_date && <span>📅 {task.due_date}</span>}
+                  {task.assignee && <span>{task.assignee}</span>}
+                  {task.due_date && <span>{task.due_date}</span>}
                 </div>
               </div>
             ))}
@@ -221,7 +177,7 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
       {/* Decisions */}
       {artifacts.decisions.length > 0 && (
         <div className="card">
-          <h3 className={styles.artifactTitle}>🎯 Decisions ({artifacts.decisions.length})</h3>
+          <h3 className={styles.artifactTitle}>Decisions ({artifacts.decisions.length})</h3>
           <div className={styles.artifactList}>
             {artifacts.decisions.map((decision) => (
               <div key={decision.id} className={styles.decisionCard}>
@@ -244,11 +200,11 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
       {/* Blockers */}
       {artifacts.blockers.length > 0 && (
         <div className="card">
-          <h3 className={styles.artifactTitle}>🚧 Blockers ({artifacts.blockers.length})</h3>
+          <h3 className={styles.artifactTitle}>Blockers ({artifacts.blockers.length})</h3>
           <div className={styles.artifactList}>
             {artifacts.blockers.map((blocker) => (
               <div key={blocker.id} className={styles.blockerCard}>
-                <h4 className={styles.blockerTitle}>⚠️ {blocker.title}</h4>
+                <h4 className={styles.blockerTitle}>{blocker.title}</h4>
                 <p>{blocker.description}</p>
                 {blocker.resolution_plan && (
                   <p className={styles.resolution}>
@@ -265,7 +221,7 @@ function ResultsView({ artifacts, jobId }: { artifacts: MeetingArtifacts; jobId:
       {/* Action Items */}
       {artifacts.action_items.length > 0 && (
         <div className="card">
-          <h3 className={styles.artifactTitle}>📌 Action Items ({artifacts.action_items.length})</h3>
+          <h3 className={styles.artifactTitle}>Action Items ({artifacts.action_items.length})</h3>
           <ul className={styles.actionList}>
             {artifacts.action_items.map((item) => (
               <li key={item.id} className={styles.actionItem}>

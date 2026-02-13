@@ -27,6 +27,11 @@
   margin: 0 auto 2rem;
 }
 
+.statusCard {
+  max-width: 600px;
+  margin: 0 auto 2rem;
+}
+
 .sectionTitle {
   font-size: 1.25rem;
   font-weight: 600;
