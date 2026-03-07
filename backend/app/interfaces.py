@@ -1,11 +1,8 @@
 """
-Abstract base classes (Interfaces) for Meetolog services.
+Abstract base classes (interfaces) for Meetolog services.
 
-These interfaces define the contracts for storage and service layers,
-enabling dependency injection, test mocking, and future implementations
-(e.g., Redis for JobStore, different LLM providers).
-
-Design Pattern: Strategy Pattern + Dependency Injection
+Defines contracts for storage and service layers, enabling
+dependency injection and test mocking.
 """
 
 from abc import ABC, abstractmethod
@@ -13,12 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from .models import JobResponse, MeetingArtifacts
+from .models import JobResponse, MeetingArtifacts, ProcessingStatus
 
-
-# =============================================================================
-# Job Store Interface
-# =============================================================================
 
 class JobStore(ABC):
     @abstractmethod
@@ -32,6 +25,13 @@ class JobStore(ABC):
     @abstractmethod
     async def update(self, job_id: UUID, **kwargs: Any) -> JobResponse | None:
         ...
+
+    @abstractmethod
+    async def update_job_stage(
+        self, job_id: UUID | str, status: ProcessingStatus, progress: int
+    ) -> None:
+        """Atomically set *status* and *progress* in a single write."""
+        ...
     
     @abstractmethod
     async def exists(self, job_id: UUID) -> bool:
@@ -41,20 +41,13 @@ class JobStore(ABC):
     async def delete(self, job_id: UUID) -> bool:
         ...
 
+    @abstractmethod
+    async def update_artifacts(self, job_id: UUID, artifacts: MeetingArtifacts) -> JobResponse:
+        ...
 
-# =============================================================================
-# Transcriber Interface
-# =============================================================================
 
 class Transcriber(ABC):
-    """
-    Abstract interface for Speech-to-Text transcription.
-    
-    Implementations:
-    - WhisperTranscriber: Local OpenAI Whisper model (production)
-    - MockTranscriber: Returns hardcoded text for testing (CI mode)
-    - DeepgramTranscriber: Cloud-based Deepgram API (Version 2)
-    """
+    """Abstract interface for speech-to-text transcription."""
     
     @abstractmethod
     async def transcribe(self, audio_path: Path) -> str:
@@ -86,20 +79,19 @@ class Transcriber(ABC):
         """
         ...
 
+    async def transcribe_chunk(self, chunk_path: Path) -> str:
+        """
+        Transcribe a single audio chunk.
 
-# =============================================================================
-# LLM Extractor Interface
-# =============================================================================
+        Non-abstract default delegates to :meth:`transcribe`.
+        ``WhisperTranscriber`` overrides this with chunk-specific logic.
+        ``MockTranscriber`` inherits the default so it stays untouched.
+        """
+        return await self.transcribe(chunk_path)
+
 
 class LLMExtractor(ABC):
-    """
-    Abstract interface for semantic artifact extraction using LLMs.
-    
-    Implementations:
-    - GeminiExtractor: Google Gemini API (production)
-    - MockExtractor: Returns deterministic JSON for testing (CI mode)
-    - OpenAIExtractor: OpenAI GPT API (Version 2)
-    """
+    """Abstract interface for semantic artifact extraction using LLMs."""
     
     @abstractmethod
     async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:

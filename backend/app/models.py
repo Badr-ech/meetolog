@@ -5,7 +5,7 @@ These define the structured output format of the semantic extraction.
 
 from datetime import datetime
 from enum import Enum
-from typing import Literal
+from typing import Literal, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -33,6 +33,7 @@ class Task(BaseModel):
     priority: Priority = Field(default=Priority.MEDIUM)
     status: TaskStatus = Field(default=TaskStatus.TODO)
     due_date: str | None = Field(default=None, description="Expected completion date if mentioned")
+    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Extraction confidence (0.0–1.0)")
 
 
 class UserStory(BaseModel):
@@ -44,6 +45,7 @@ class UserStory(BaseModel):
     acceptance_criteria: list[str] = Field(default_factory=list)
     priority: Priority = Field(default=Priority.MEDIUM)
     story_points: int | None = Field(default=None, description="Estimated complexity")
+    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Extraction confidence (0.0–1.0)")
 
 
 class Decision(BaseModel):
@@ -53,6 +55,7 @@ class Decision(BaseModel):
     made_by: str | None = Field(default=None, description="Who made the decision")
     rationale: str = Field(default="", description="Why this decision was made")
     timestamp: str | None = Field(default=None, description="When in the meeting this was decided")
+    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Extraction confidence (0.0–1.0)")
 
 
 class Blocker(BaseModel):
@@ -62,6 +65,7 @@ class Blocker(BaseModel):
     affected_tasks: list[str] = Field(default_factory=list, description="Tasks impacted by this blocker")
     owner: str | None = Field(default=None, description="Person responsible for resolving")
     resolution_plan: str = Field(default="", description="Proposed solution if discussed")
+    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Extraction confidence (0.0–1.0)")
 
 
 class ActionItem(BaseModel):
@@ -69,6 +73,7 @@ class ActionItem(BaseModel):
     description: str
     assignee: str | None = None
     due_date: str | None = None
+    confidence_score: Optional[float] = Field(default=None, ge=0.0, le=1.0, description="Extraction confidence (0.0–1.0)")
 
 
 class ActionableTask(BaseModel):
@@ -86,6 +91,10 @@ class ActionableTask(BaseModel):
     dependencies: list[str] = Field(
         default_factory=list,
         description="Other tasks or conditions this task depends on",
+    )
+    confidence_score: Optional[float] = Field(
+        default=None, ge=0.0, le=1.0,
+        description="Extraction confidence (0.0–1.0)",
     )
 
 
@@ -111,13 +120,44 @@ class MeetingArtifacts(BaseModel):
 
 
 class ProcessingStatus(str, Enum):
-    """Status of the audio processing job."""
-    PENDING = "pending"
+    """
+    Status of the audio processing job.
+
+    v1.1 granular states provide per-stage feedback to the frontend.
+    Legacy values ``"pending"`` and ``"processing"`` are accepted on
+    read via :func:`parse_processing_status` but should not be written
+    by new code.
+    """
+    UPLOADING = "uploading"
     TRANSCRIBING = "transcribing"
     EXTRACTING = "extracting"
     GENERATING_PDF = "generating_pdf"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility mapping for Redis records written before v1.1
+# ---------------------------------------------------------------------------
+_LEGACY_STATUS_MAP: dict[str, ProcessingStatus] = {
+    "pending": ProcessingStatus.UPLOADING,
+    "processing": ProcessingStatus.TRANSCRIBING,
+}
+
+
+def parse_processing_status(value: str) -> ProcessingStatus:
+    """Convert a raw status string to a ``ProcessingStatus`` enum member.
+
+    Handles legacy ``"pending"`` / ``"processing"`` values transparently.
+    Falls back to ``UPLOADING`` for completely unknown values.
+    """
+    try:
+        return ProcessingStatus(value)
+    except ValueError:
+        mapped = _LEGACY_STATUS_MAP.get(value)
+        if mapped is not None:
+            return mapped
+        return ProcessingStatus.UPLOADING
 
 
 class JobResponse(BaseModel):

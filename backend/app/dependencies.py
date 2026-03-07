@@ -1,23 +1,8 @@
 """
-Service Factory and Dependency Injection for Meetolog.
+Service factory and dependency injection.
 
-This module implements the Factory Pattern to create service instances
-based on configuration. It handles:
-
-1. TEST_MODE detection - Use mocks for CI/CD and testing
-2. API key validation - Graceful degradation if keys are missing
-3. Singleton patterns - Reuse service instances efficiently
-
-Usage in FastAPI:
-    from .dependencies import get_transcriber, get_extractor, get_job_store
-    
-    @app.post("/upload")
-    async def upload(
-        transcriber: Annotated[Transcriber, Depends(get_transcriber)],
-        extractor: Annotated[LLMExtractor, Depends(get_extractor)],
-        job_store: Annotated[JobStore, Depends(get_job_store)],
-    ):
-        ...
+Implements the Factory Pattern to create service instances
+based on configuration (TEST_MODE, API key availability).
 """
 
 import logging
@@ -32,18 +17,10 @@ from .interfaces import JobStore, Transcriber, LLMExtractor
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Singleton Service Instances
-# =============================================================================
-
 _job_store: JobStore | None = None
 _transcriber: Transcriber | None = None
 _extractor: LLMExtractor | None = None
 
-
-# =============================================================================
-# Factory Functions
-# =============================================================================
 
 def create_job_store(settings: Settings) -> JobStore:
     from .services.job_store import LocalJobStore
@@ -79,14 +56,7 @@ def create_transcriber(settings: Settings) -> Transcriber:
 
 
 def create_extractor(settings: Settings) -> LLMExtractor:
-    """
-    Create and return an LLMExtractor instance based on configuration.
-    
-    Logic:
-    1. If TEST_MODE=true → MockExtractor
-    2. If GEMINI_API_KEY is missing → MockExtractor with warning
-    3. Otherwise → GeminiExtractor (production)
-    """
+    """Create an LLMExtractor: MockExtractor in test mode or when API key is missing, else GeminiExtractor."""
     if settings.test_mode:
         from .services.mock_services import MockExtractor
         
@@ -98,7 +68,7 @@ def create_extractor(settings: Settings) -> LLMExtractor:
         from .services.mock_services import MockExtractor
         
         logger.warning(
-            "⚠️  GEMINI_API_KEY is not set! "
+            "GEMINI_API_KEY is not set. "
             "The application will use MockExtractor (deterministic test data). "
             "To use real LLM extraction, set the GEMINI_API_KEY environment variable."
         )
@@ -120,10 +90,6 @@ def create_extractor(settings: Settings) -> LLMExtractor:
         logger.warning("Falling back to MockExtractor due to initialization failure")
         return MockExtractor(simulated_delay=0.3)
 
-
-# =============================================================================
-# Dependency Injection Functions (for FastAPI Depends)
-# =============================================================================
 
 def get_job_store() -> JobStore:
     global _job_store
@@ -155,24 +121,16 @@ def get_extractor() -> LLMExtractor:
     return _extractor
 
 
-# =============================================================================
-# Type Aliases for FastAPI Depends
-# =============================================================================
-
 JobStoreDep = Annotated[JobStore, Depends(get_job_store)]
 TranscriberDep = Annotated[Transcriber, Depends(get_transcriber)]
 LLMExtractorDep = Annotated[LLMExtractor, Depends(get_extractor)]
 
 
-# =============================================================================
-# Initialization & Cleanup (v2 - mostly deprecated, kept for backwards compat)
-# =============================================================================
-
 async def initialize_services() -> None:
     settings = get_settings()
     
     logger.info("=" * 60)
-    logger.info("Initializing Meetolog services (v2)...")
+    logger.info("Initializing Meetolog services...")
     logger.info(f"  TEST_MODE: {settings.test_mode}")
     logger.info(f"  LLM_PROVIDER: {settings.llm_provider}")
     logger.info(f"  GEMINI_API_KEY: {'[SET]' if settings.gemini_api_key else '[NOT SET]'}")

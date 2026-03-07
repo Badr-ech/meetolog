@@ -1,24 +1,9 @@
 """
-ARQ Background Worker for Meetolog v2.
+ARQ Background Worker for Meetolog.
 
-This module defines the ARQ worker that processes audio files through
-the complete pipeline:
-1. Transcription (Whisper)
-2. LLM Extraction (Gemini/OpenAI)
-3. PDF Generation
-
-Features:
-- Async-native processing with proper error handling
-- Redis-backed state persistence
-- Pipeline resumability via transcript/artifact caching
-- Graceful degradation on failures
-
-Usage:
-    # Start worker from backend directory:
-    arq app.worker.WorkerSettings
-    
-    # Or with hot-reload for development:
-    arq app.worker.WorkerSettings --watch app
+Processes audio files through the transcription → extraction → PDF pipeline.
+Supports transcript/artifact caching for pipeline resumability and
+graceful recovery of interrupted jobs on restart.
 """
 
 import asyncio
@@ -52,10 +37,6 @@ logging.basicConfig(
 )
 
 
-# =============================================================================
-# Service Factories (for worker context)
-# =============================================================================
-
 def get_transcriber():
     settings = get_settings()
     
@@ -82,10 +63,6 @@ def get_pdf_service():
     settings = get_settings()
     return PDFGeneratorService(Path(settings.output_dir))
 
-
-# =============================================================================
-# Main Processing Task
-# =============================================================================
 
 async def process_audio_job(
     ctx: dict,
@@ -128,15 +105,15 @@ async def process_audio_job(
     audio_path = Path(file_path)
     
     try:
-        # =====================================================================
-        # Stage 1: Transcription (10-40%) — chunked for restart resilience
-        # =====================================================================
+        # Stage 1: Transcription
         logger.info(f"[{job_id}] Stage 1: Transcription starting")
-        
-        await job_store.update(
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.TRANSCRIBING,
-            progress=10,
+            progress=25,
+        )
+        await job_store.update(
+            job_uuid,
             message="Transcribing audio...",
         )
         
@@ -189,65 +166,32 @@ async def process_audio_job(
                     effective_audio = restored_path
                     logger.info(f"[{job_id}] Audio restored from Redis")
                 
-                # -----------------------------------------------------------------
-                # Split into chunks and transcribe incrementally
-                # -----------------------------------------------------------------
-                from app.services.transcription import (
-                    split_audio_into_chunks,
-                    get_audio_duration,
-                )
-                
-                chunk_dir = work_dir / "chunks"
-                chunks = await asyncio.to_thread(
-                    split_audio_into_chunks, effective_audio, chunk_dir
-                )
-                total_chunks = len(chunks)
-                logger.info(f"[{job_id}] Audio split into {total_chunks} chunks")
-                
-                # Check which chunks were already transcribed (prior partial run)
-                completed_indices, _ = await job_store.get_completed_chunk_indices(job_uuid)
-                
-                if completed_indices:
-                    logger.info(
-                        f"[{job_id}] Resuming: {len(completed_indices)}/{total_chunks} "
-                        f"chunks already done"
-                    )
-                
-                # Transcribe remaining chunks
+                # ---------------------------------------------------------
+                # Transcribe (chunking + gc handled inside the transcriber)
+                # ---------------------------------------------------------
                 transcriber = get_transcriber()
-                
-                for i, chunk_path in enumerate(chunks):
-                    if i in completed_indices:
-                        continue
-                    
-                    # Progress: spread 10-38% across chunks
-                    chunk_progress = 10 + int(28 * (i / total_chunks))
-                    await job_store.update(
-                        job_uuid,
-                        progress=chunk_progress,
-                        message=f"Transcribing chunk {i + 1}/{total_chunks}...",
-                    )
-                    
-                    chunk_text = await transcriber.transcribe_chunk(chunk_path)
-                    chunk_text = await transcriber.preprocess_transcript(chunk_text)
 
-                    # Cache immediately — survives restarts
-                    await job_store.save_chunk_transcript(
-                        job_uuid, i, chunk_text, total_chunks
-                    )
-                    logger.info(
-                        f"[{job_id}] Chunk {i + 1}/{total_chunks} transcribed and cached"
-                    )
-                
-                # Assemble full transcript from all chunks
-                transcript = await job_store.assemble_transcript_from_chunks(job_uuid)
-                if not transcript:
-                    raise RuntimeError("Failed to assemble transcript from chunks")
-                
-                # Cache the full transcript and clean up chunk/audio data
+                # Attach per-chunk progress callback (WhisperTranscriber
+                # exposes ``on_chunk_complete``; MockTranscriber does not).
+                if hasattr(transcriber, "on_chunk_complete"):
+                    async def _on_chunk(
+                        chunk_idx: int, total: int, text: str,
+                    ) -> None:
+                        pct = 25 + int(23 * ((chunk_idx + 1) / total))
+                        await job_store.update(
+                            job_uuid,
+                            progress=pct,
+                            message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
+                        )
+
+                    transcriber.on_chunk_complete = _on_chunk
+
+                transcript = await transcriber.transcribe(effective_audio)
+
+                # Cache the full transcript for restart resilience
                 await job_store.cache_transcript(job_uuid, transcript)
                 await job_store.delete_chunk_data(job_uuid)
-                logger.info(f"[{job_id}] Full transcript cached, chunk data cleaned up")
+                logger.info(f"[{job_id}] Full transcript cached")
                 
             finally:
                 # Clean up temp directory
@@ -255,22 +199,22 @@ async def process_audio_job(
         
         await job_store.update(
             job_uuid,
-            progress=40,
+            progress=48,
             message="Transcription complete",
         )
         
         transcription_time = time.time() - start_time
         logger.info(f"[{job_id}] Transcription completed in {transcription_time:.2f}s")
         
-        # =====================================================================
-        # Stage 2: LLM Extraction (40-75%)
-        # =====================================================================
+        # Stage 2: LLM Extraction
         logger.info(f"[{job_id}] Stage 2: LLM Extraction starting")
-        
-        await job_store.update(
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.EXTRACTING,
-            progress=45,
+            progress=50,
+        )
+        await job_store.update(
+            job_uuid,
             message="Extracting Agile artifacts...",
         )
         
@@ -284,30 +228,42 @@ async def process_audio_job(
             llm_provider = get_llm_provider()
             artifacts = await llm_provider.extract_artifacts(transcript)
             
+            # Backfill confidence scores via heuristic for any artifacts
+            # where the LLM (or mock) did not provide a score.
+            from app.services.heuristics import backfill_confidence_scores
+            backfill_confidence_scores(artifacts)
+            
             # Cache artifacts for resumability
             await job_store.cache_artifacts(job_uuid, artifacts)
             logger.info(f"[{job_id}] Artifacts cached for resumability")
         
         await job_store.update(
             job_uuid,
-            progress=75,
+            progress=72,
             message="Artifact extraction complete",
         )
         
         extraction_time = time.time() - start_time - transcription_time
         logger.info(f"[{job_id}] Extraction completed in {extraction_time:.2f}s")
         
-        # =====================================================================
-        # Stage 3: PDF Generation (75-95%)
-        # =====================================================================
+        # Stage 3: PDF Generation
         logger.info(f"[{job_id}] Stage 3: PDF Generation starting")
-        
-        await job_store.update(
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.GENERATING_PDF,
-            progress=80,
+            progress=75,
+        )
+        await job_store.update(
+            job_uuid,
             message="Generating PDF summary...",
         )
+        
+        # Re-fetch the latest artifacts from Redis so that any user edits
+        # made between extraction and PDF generation are reflected.
+        latest_artifacts = await job_store.get_cached_artifacts(job_uuid)
+        if latest_artifacts is not None:
+            artifacts = latest_artifacts
+            logger.info(f"[{job_id}] Using latest artifacts from Redis for PDF")
         
         pdf_service = get_pdf_service()
         pdf_filename = f"meeting_{job_id}.pdf"
@@ -316,28 +272,28 @@ async def process_audio_job(
         await job_store.update(
             job_uuid,
             progress=95,
-            message="PDF generation complete",
+            message="PDF generated, finalising...",
         )
         
         pdf_time = time.time() - start_time - transcription_time - extraction_time
         logger.info(f"[{job_id}] PDF generated in {pdf_time:.2f}s: {pdf_path}")
         
-        # =====================================================================
-        # Stage 4: Completion (100%)
-        # =====================================================================
+        # Stage 4: Completion
         total_time = time.time() - start_time
-        
-        await job_store.update(
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.COMPLETED,
             progress=100,
+        )
+        await job_store.update(
+            job_uuid,
             message="Processing complete!",
             pdf_url=f"/download/{job_id}",
             artifacts=artifacts,
         )
         
         logger.info(
-            f"[{job_id}] ✅ Pipeline completed successfully in {total_time:.2f}s "
+            f"[{job_id}] Pipeline completed successfully in {total_time:.2f}s "
             f"(transcribe: {transcription_time:.2f}s, extract: {extraction_time:.2f}s, pdf: {pdf_time:.2f}s)"
         )
         
@@ -353,41 +309,39 @@ async def process_audio_job(
         }
         
     except FileNotFoundError as e:
-        logger.error(f"[{job_id}] ❌ File not found: {e}")
-        await job_store.update(
+        logger.error(f"[{job_id}] File not found: {e}")
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.FAILED,
+            progress=0,
+        )
+        await job_store.update(
+            job_uuid,
             error=f"Audio file not found: {e}",
             message="Processing failed: File not found",
         )
         return {"status": "failed", "job_id": job_id, "error": str(e)}
         
     except Exception as e:
-        logger.exception(f"[{job_id}] ❌ Pipeline failed with error: {e}")
-        await job_store.update(
+        logger.exception(f"[{job_id}] Pipeline failed with error: {e}")
+        await job_store.update_job_stage(
             job_uuid,
             status=ProcessingStatus.FAILED,
+            progress=0,
+        )
+        await job_store.update(
+            job_uuid,
             error=str(e),
             message=f"Processing failed: {e}",
         )
         return {"status": "failed", "job_id": job_id, "error": str(e)}
 
 
-# =============================================================================
-# Worker Lifecycle Hooks
-# =============================================================================
-
 async def startup(ctx: dict) -> None:
     """
-    Worker startup hook - initialize shared resources.
-    
-    Called once when the worker starts. Sets up:
-    - Redis connection pool
-    - Job store instance
-    - Zombie job recovery with resumability
-    - Logging configuration
+    Worker startup hook — initialise shared resources and recover stale jobs.
     """
-    logger.info("🚀 ARQ Worker starting up...")
+    logger.info("ARQ Worker starting up...")
     
     # Initialize Redis connection
     redis = await get_redis_pool()
@@ -404,9 +358,9 @@ async def startup(ctx: dict) -> None:
         stale_jobs = await job_store.find_stale_jobs()
         
         if not stale_jobs:
-            logger.info("✅ No stale jobs found")
+            logger.info("No stale jobs found")
         else:
-            logger.warning(f"🧟 Found {len(stale_jobs)} stale job(s), attempting recovery...")
+            logger.warning(f"Found {len(stale_jobs)} stale job(s), attempting recovery...")
             
             # Get ARQ pool for re-queuing
             arq_pool = await create_pool(get_arq_redis_settings())
@@ -443,7 +397,7 @@ async def startup(ctx: dict) -> None:
                         if has_audio:
                             resume_reason.append("stored audio")
                         logger.info(
-                            f"✅ Re-queued job {job_id} for resumption "
+                            f"Re-queued job {job_id} for resumption "
                             f"({', '.join(resume_reason)})"
                         )
                     except Exception as e:
@@ -460,12 +414,12 @@ async def startup(ctx: dict) -> None:
                         "Job interrupted by server restart. Please re-upload your file."
                     )
                     failed += 1
-                    logger.warning(f"❌ Marked job {job_id} as failed (no cached progress or audio)")
+                    logger.warning(f"Marked job {job_id} as failed (no cached progress or audio)")
             
             await arq_pool.close()
             
             logger.info(
-                f"🔄 Recovery complete: {resumed} resumed, {failed} failed"
+                f"Recovery complete: {resumed} resumed, {failed} failed"
             )
     except Exception as e:
         logger.error(f"Failed to recover zombie jobs: {e}")
@@ -475,29 +429,24 @@ async def startup(ctx: dict) -> None:
     settings = get_settings()
     if not settings.test_mode:
         try:
-            logger.info(f"🔊 Pre-warming Whisper model: {settings.whisper_model}")
+            logger.info(f"Pre-warming Whisper model: {settings.whisper_model}")
             from app.services.transcription import _get_cached_model
             import asyncio
             await asyncio.to_thread(_get_cached_model, settings.whisper_model)
-            logger.info("🔊 Whisper model ready")
+            logger.info("Whisper model ready")
         except Exception as e:
             logger.warning(f"Failed to pre-warm Whisper model (will load on first job): {e}")
     
-    logger.info("✅ Worker startup complete")
+    logger.info("Worker startup complete")
 
 
 async def shutdown(ctx: dict) -> None:
-    """
-    Worker shutdown hook - cleanup resources.
-    
-    Called when the worker is shutting down. Cleans up:
-    - Redis connection pool
-    """
-    logger.info("🛑 ARQ Worker shutting down...")
+    """Worker shutdown hook — release the Redis connection pool."""
+    logger.info("ARQ Worker shutting down...")
     
     await close_redis_pool()
     
-    logger.info("✅ Worker shutdown complete")
+    logger.info("Worker shutdown complete")
 
 
 async def on_job_start(ctx: dict) -> None:
@@ -510,20 +459,8 @@ async def on_job_end(ctx: dict) -> None:
     logger.debug("Job ended")
 
 
-# =============================================================================
-# Worker Settings (ARQ Configuration)
-# =============================================================================
-
 class WorkerSettings:
-    """
-    ARQ Worker configuration.
-    
-    This class defines all worker settings including:
-    - Redis connection settings
-    - Task functions to register
-    - Lifecycle hooks
-    - Job retry and timeout settings
-    """
+    """ARQ Worker configuration."""
     
     # Redis connection
     redis_settings = get_arq_redis_settings()
@@ -544,7 +481,7 @@ class WorkerSettings:
     retry_delay = 60  # Wait 60 seconds before retry
     
     # Health check
-    health_check_interval = 60  # Seconds between health checks
+    health_check_interval = 60
     
     # Queue name (use ARQ default)
     # queue_name = "arq:queue"  # Default, no need to specify
@@ -553,20 +490,7 @@ class WorkerSettings:
     log_results = True
 
 
-# =============================================================================
-# CLI Entry Point
-# =============================================================================
-
 if __name__ == "__main__":
-    """
-    Direct execution entry point.
-    
-    This allows running the worker with:
-        python -m app.worker
-        
-    Or the standard ARQ command:
-        arq app.worker.WorkerSettings
-    """
     import arq
     
     print("Starting Meetolog ARQ Worker...")

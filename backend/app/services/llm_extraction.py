@@ -21,6 +21,7 @@ from ..models import (
     ActionItem,
     Priority,
 )
+from .heuristics import calculate_artifact_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ INSTRUCTIONS:
 7. Estimate story points for user stories using Fibonacci sequence (1, 2, 3, 5, 8, 13)
 8. Assign priorities based on context and urgency (low, medium, high, critical)
 9. Generate a concise 2-3 sentence summary of the meeting
+10. For each artifact, include a 'confidence_score' between 0.0 and 1.0 representing how explicitly this item was discussed in the meeting.
 
 CRITICAL: Return ONLY valid JSON with no additional text, markdown formatting, or explanation.
 The response must be parseable by json.loads() directly.
@@ -105,7 +107,8 @@ Required JSON structure:
             "so_that": "benefit or value",
             "acceptance_criteria": ["list of acceptance criteria if mentioned"],
             "priority": "low|medium|high|critical",
-            "story_points": null or number (1, 2, 3, 5, 8, 13)
+            "story_points": null or number (1, 2, 3, 5, 8, 13),
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ],
     "tasks": [
@@ -114,7 +117,8 @@ Required JSON structure:
             "description": "string - detailed description",
             "assignee": "name or null if not assigned",
             "priority": "low|medium|high|critical",
-            "due_date": "string or null if not mentioned"
+            "due_date": "string or null if not mentioned",
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ],
     "decisions": [
@@ -122,7 +126,8 @@ Required JSON structure:
             "title": "string - decision summary",
             "description": "string - full decision details",
             "made_by": "name or null",
-            "rationale": "string - reason for the decision"
+            "rationale": "string - reason for the decision",
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ],
     "blockers": [
@@ -131,14 +136,16 @@ Required JSON structure:
             "description": "string - details about the blocker",
             "affected_tasks": ["list of affected task titles"],
             "owner": "name responsible for resolving or null",
-            "resolution_plan": "string - proposed solution if discussed"
+            "resolution_plan": "string - proposed solution if discussed",
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ],
     "action_items": [
         {{
             "description": "string - what needs to be done",
             "assignee": "name or null",
-            "due_date": "string or null"
+            "due_date": "string or null",
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ],
     "execution_tasks": [
@@ -148,7 +155,8 @@ Required JSON structure:
             "owner_role": "string - responsible role (Engineering, Design, Product, DevOps, QA) or specific name",
             "priority": "High|Medium|Low",
             "task_source": "Explicit|Inferred",
-            "dependencies": ["list of other tasks or conditions this depends on"]
+            "dependencies": ["list of other tasks or conditions this depends on"],
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ]
 }}
@@ -225,6 +233,33 @@ Now analyze the transcript and return the JSON:"""
             logger.error(f"LLM extraction failed: {e}")
             raise RuntimeError(f"Failed to extract artifacts: {e}") from e
     
+    # -----------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------
+
+    @staticmethod
+    def _safe_confidence(raw: object) -> float | None:
+        """Coerce an LLM-provided confidence value to a float or None."""
+        if raw is None:
+            return None
+        try:
+            val = float(raw)
+            if 0.0 <= val <= 1.0:
+                return round(val, 2)
+            return None  # out of range → treat as missing
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _inject_scores(items: list[dict], artifact_type: str) -> None:
+        """Mutate *items* in-place, filling missing confidence_score via heuristic."""
+        for item in items:
+            parsed = GeminiExtractor._safe_confidence(item.get("confidence_score"))
+            if parsed is not None:
+                item["confidence_score"] = parsed
+            else:
+                item["confidence_score"] = calculate_artifact_confidence(item, artifact_type)
+
     def _parse_extraction(self, data: dict, transcript: str) -> MeetingArtifacts:
         """Parse the LLM JSON response into Pydantic models."""
         
@@ -236,7 +271,22 @@ Now analyze the transcript and return the JSON:"""
                 "critical": Priority.CRITICAL
             }
             return mapping.get(p.lower() if p else "medium", Priority.MEDIUM)
-        
+
+        # --- Inject heuristic scores where the LLM omitted them ----------
+        raw_stories = data.get("user_stories", [])
+        raw_tasks = data.get("tasks", [])
+        raw_decisions = data.get("decisions", [])
+        raw_blockers = data.get("blockers", [])
+        raw_action_items = data.get("action_items", [])
+        raw_execution = data.get("execution_tasks", [])
+
+        self._inject_scores(raw_stories, "user_story")
+        self._inject_scores(raw_tasks, "task")
+        self._inject_scores(raw_decisions, "decision")
+        self._inject_scores(raw_blockers, "blocker")
+        self._inject_scores(raw_action_items, "action_item")
+        self._inject_scores(raw_execution, "execution_task")
+
         user_stories = [
             UserStory(
                 title=s.get("title", ""),
@@ -246,8 +296,9 @@ Now analyze the transcript and return the JSON:"""
                 acceptance_criteria=s.get("acceptance_criteria", []),
                 priority=parse_priority(s.get("priority", "medium")),
                 story_points=s.get("story_points"),
+                confidence_score=s.get("confidence_score"),
             )
-            for s in data.get("user_stories", [])
+            for s in raw_stories
         ]
         
         tasks = [
@@ -257,8 +308,9 @@ Now analyze the transcript and return the JSON:"""
                 assignee=t.get("assignee"),
                 priority=parse_priority(t.get("priority", "medium")),
                 due_date=t.get("due_date"),
+                confidence_score=t.get("confidence_score"),
             )
-            for t in data.get("tasks", [])
+            for t in raw_tasks
         ]
         
         decisions = [
@@ -267,8 +319,9 @@ Now analyze the transcript and return the JSON:"""
                 description=d.get("description", ""),
                 made_by=d.get("made_by"),
                 rationale=d.get("rationale", ""),
+                confidence_score=d.get("confidence_score"),
             )
-            for d in data.get("decisions", [])
+            for d in raw_decisions
         ]
         
         blockers = [
@@ -278,8 +331,9 @@ Now analyze the transcript and return the JSON:"""
                 affected_tasks=b.get("affected_tasks", []),
                 owner=b.get("owner"),
                 resolution_plan=b.get("resolution_plan", ""),
+                confidence_score=b.get("confidence_score"),
             )
-            for b in data.get("blockers", [])
+            for b in raw_blockers
         ]
         
         action_items = [
@@ -287,8 +341,9 @@ Now analyze the transcript and return the JSON:"""
                 description=a.get("description", ""),
                 assignee=a.get("assignee"),
                 due_date=a.get("due_date"),
+                confidence_score=a.get("confidence_score"),
             )
-            for a in data.get("action_items", [])
+            for a in raw_action_items
         ]
         
         execution_tasks = [
@@ -299,8 +354,9 @@ Now analyze the transcript and return the JSON:"""
                 priority=et.get("priority", "Medium"),
                 task_source=et.get("task_source", "Explicit"),
                 dependencies=et.get("dependencies", []),
+                confidence_score=et.get("confidence_score"),
             )
-            for et in data.get("execution_tasks", [])
+            for et in raw_execution
         ]
         
         return MeetingArtifacts(

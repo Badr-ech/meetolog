@@ -4,11 +4,10 @@
 .env.local
 .env.*.local
 
-# Markdown files
+# Markdown files (ignore AI-generated planning docs)
 *.md
 !README.md
-!README.txt
-!README.rst
+!CAPSTONE_REPORT.md
 
 # Ignore outputs and uploads (generated files)
 outputs/

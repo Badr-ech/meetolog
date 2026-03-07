@@ -1,23 +1,13 @@
 """
-Services layer for business logic (v2).
+Services layer — business logic implementations.
 
-This module exports both abstract interfaces and concrete implementations.
-Use the factory functions in dependencies.py for proper instantiation.
-
-Note: Imports are lazy to allow TEST_MODE to work even if some 
-production dependencies (e.g., reportlab, whisper) are not installed.
-
-v2 Additions:
-- LLMProvider abstraction layer (llm_engine.py)
-- GeminiProvider, OpenAIProvider implementations
-- get_llm_provider() factory function
+Imports are lazy so TEST_MODE works even when production
+dependencies (reportlab, whisper) are not installed.
 """
 
-# These are always available (no external deps)
+# Always available (no external deps)
 from .mock_services import MockTranscriber, MockExtractor
 from .job_store import LocalJobStore
-
-# Production services - imported on demand to allow graceful degradation
 
 
 def __getattr__(name: str):
@@ -31,15 +21,6 @@ def __getattr__(name: str):
     elif name == "PDFGeneratorService":
         from .pdf_generator import PDFGeneratorService
         return PDFGeneratorService
-    elif name == "TranscriptionService":
-        # Legacy alias
-        from .transcription import WhisperTranscriber
-        return WhisperTranscriber
-    elif name == "LLMExtractionService":
-        # Legacy alias
-        from .llm_extraction import GeminiExtractor
-        return GeminiExtractor
-    # v2 LLM abstraction layer
     elif name == "LLMProvider":
         from .llm_engine import LLMProvider
         return LLMProvider
@@ -56,20 +37,14 @@ def __getattr__(name: str):
 
 
 __all__ = [
-    # Production services
     "WhisperTranscriber",
     "GeminiExtractor",
     "PDFGeneratorService",
     "LocalJobStore",
-    # Mock services
     "MockTranscriber",
     "MockExtractor",
-    # v2 LLM abstraction
     "LLMProvider",
     "GeminiProvider",
     "OpenAIProvider",
     "get_llm_provider",
-    # Legacy aliases
-    "TranscriptionService",
-    "LLMExtractionService",
 ]

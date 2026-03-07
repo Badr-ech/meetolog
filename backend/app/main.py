@@ -1,11 +1,8 @@
 """
-Meetolog Backend - FastAPI Application (v2)
-Main entry point with API endpoints for audio processing.
+Meetolog Backend — FastAPI application entry point.
 
-v2 Architecture:
-- Redis-backed job state persistence
-- ARQ background queue for processing
-- Horizontal scaling ready
+Defines all HTTP endpoints for audio upload, job status polling,
+artifact retrieval/editing, PDF download, and Jira export.
 """
 
 import logging
@@ -22,6 +19,8 @@ from fastapi import FastAPI, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
+from fastapi.responses import JSONResponse
+
 from .config import get_settings
 from .models import JobResponse, ProcessingStatus, MeetingArtifacts
 from .infrastructure.redis import (
@@ -31,6 +30,7 @@ from .infrastructure.redis import (
     check_redis_health,
 )
 from .infrastructure.job_store import RedisJobStore
+from .services.jira_mapper import map_artifacts_to_jira
 
 # Configure logging
 logging.basicConfig(
@@ -46,10 +46,6 @@ settings = get_settings()
 # ARQ connection pool (singleton)
 _arq_pool: ArqRedis | None = None
 
-
-# =============================================================================
-# Dependency Injection
-# =============================================================================
 
 async def get_job_store() -> RedisJobStore:
     redis = await get_redis_pool()
@@ -70,46 +66,42 @@ async def get_arq_pool() -> ArqRedis:
 JobStoreDep = Annotated[RedisJobStore, Depends(get_job_store)]
 
 
-# =============================================================================
-# Application Lifespan
-# =============================================================================
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _arq_pool
     
     # Startup
-    logger.info("🚀 Starting Meetolog API (v2)...")
+    logger.info("Starting Meetolog API...")
     
     # Initialize Redis
     try:
         redis = await get_redis_pool()
-        logger.info("✅ Redis connection established")
+        logger.info("Redis connection established")
     except Exception as e:
-        logger.error(f"❌ Failed to connect to Redis: {e}")
+        logger.error(f"Failed to connect to Redis: {e}")
         logger.warning("API starting without Redis - endpoints may fail")
     
     # Initialize ARQ pool
     try:
         _arq_pool = await create_pool(get_arq_redis_settings())
-        logger.info("✅ ARQ connection pool created")
+        logger.info("ARQ connection pool created")
     except Exception as e:
-        logger.error(f"❌ Failed to create ARQ pool: {e}")
+        logger.error(f"Failed to create ARQ pool: {e}")
         logger.warning("API starting without ARQ - job enqueueing will fail")
     
     # Ensure directories exist
     Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"📁 Upload directory: {settings.upload_dir}")
-    logger.info(f"📁 Output directory: {settings.output_dir}")
-    logger.info(f"🤖 LLM Provider: {settings.llm_provider}")
-    logger.info(f"🧪 Test Mode: {settings.test_mode}")
+    logger.info(f"Upload directory: {settings.upload_dir}")
+    logger.info(f"Output directory: {settings.output_dir}")
+    logger.info(f"LLM Provider: {settings.llm_provider}")
+    logger.info(f"Test Mode: {settings.test_mode}")
     
     yield
     
     # Shutdown
-    logger.info("🛑 Shutting down Meetolog API...")
+    logger.info("Shutting down Meetolog API...")
     
     if _arq_pool is not None:
         await _arq_pool.close()
@@ -117,20 +109,20 @@ async def lifespan(app: FastAPI):
     
     await close_redis_pool()
     
-    logger.info("✅ Shutdown complete")
+    logger.info("Shutdown complete")
 
 
 # Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Meetolog API",
-    description="Transform meeting recordings into structured Agile artifacts (v2)",
+    description="Transform meeting recordings into structured Agile artifacts",
     version="2.0.0",
     lifespan=lifespan,
 )
 
 # Configure CORS for frontend access
 allowed_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
-logger.info(f"🌐 CORS allowed origins: {allowed_origins}")
+logger.info(f"CORS allowed origins: {allowed_origins}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -146,10 +138,6 @@ def get_upload_dir() -> Path:
     upload_dir.mkdir(parents=True, exist_ok=True)
     return upload_dir
 
-
-# =============================================================================
-# API Endpoints
-# =============================================================================
 
 @app.get("/")
 async def root():
@@ -178,9 +166,6 @@ async def upload_audio(
     
     Returns a job ID to track processing status.
     
-    API Contract (v1 compatible):
-    - POST /upload with multipart form data
-    - Returns: { job_id, status, message, progress }
     """
     # Validate file type
     if not file.filename:
@@ -218,10 +203,10 @@ async def upload_audio(
     
     logger.info(f"File uploaded: {file.filename} -> {audio_path} ({size_mb:.2f} MB)")
     
-    # Create job record in Redis with QUEUED status
+    # Create job record in Redis with UPLOADING status
     job = JobResponse(
         job_id=job_id,
-        status=ProcessingStatus.PENDING,  # PENDING = QUEUED in v1 API
+        status=ProcessingStatus.UPLOADING,
         message="Job queued for processing",
         progress=0,
     )
@@ -279,9 +264,6 @@ async def get_job_status(job_id: UUID, job_store: JobStoreDep):
     
     Returns progress, status, and artifacts when complete.
     
-    API Contract (v1 compatible):
-    - GET /status/{job_id}
-    - Returns: { job_id, status, message, progress, artifacts?, pdf_url?, error? }
     """
     job = await job_store.load(job_id)
     
@@ -296,9 +278,6 @@ async def download_pdf(job_id: UUID, job_store: JobStoreDep):
     """
     Download the generated PDF summary for a completed job.
     
-    API Contract (v1 compatible):
-    - GET /download/{job_id}
-    - Returns: PDF file (application/pdf)
     """
     job = await job_store.load(job_id)
     
@@ -323,14 +302,44 @@ async def download_pdf(job_id: UUID, job_store: JobStoreDep):
     )
 
 
+@app.put("/artifacts/{job_id}", response_model=JobResponse)
+async def update_artifacts(
+    job_id: UUID,
+    artifacts: MeetingArtifacts,
+    job_store: JobStoreDep,
+):
+    """
+    Replace all artifacts for a completed job.
+
+    Accepts the full MeetingArtifacts payload (PUT semantics) so that
+    Pydantic validates the entire schema on every save.  Partial updates
+    are intentionally unsupported to prevent schema drift.
+
+    - 404 if the job does not exist.
+    - 400 if the job is not in COMPLETED state.
+    - 422 (automatic) if the body violates the MeetingArtifacts schema.
+    """
+    job = await job_store.load(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != ProcessingStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot edit artifacts: job status is '{job.status.value}'. "
+                   "Only completed jobs may be edited.",
+        )
+
+    updated_job = await job_store.update_artifacts(job_id, artifacts)
+    return updated_job
+
+
 @app.get("/artifacts/{job_id}", response_model=MeetingArtifacts)
 async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
     """
     Get the extracted artifacts as JSON for a completed job.
     
-    API Contract (v1 compatible):
-    - GET /artifacts/{job_id}
-    - Returns: MeetingArtifacts JSON
     """
     job = await job_store.load(job_id)
     
@@ -353,18 +362,49 @@ async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
     return job.artifacts
 
 
-# =============================================================================
-# Health & Debugging Endpoints
-# =============================================================================
+@app.get("/export/jira/{job_id}")
+async def export_jira(job_id: UUID, job_store: JobStoreDep):
+    """
+    Export artifacts as a Jira-compatible bulk-import JSON file.
+
+    Returns a downloadable JSON file matching the Jira bulk import format:
+    ``{ "projects": [{ "key": "MEET", "issues": [...] }] }``
+
+    - 404 if the job does not exist or has no artifacts.
+    - 400 if the job is not in COMPLETED state.
+    """
+    job = await job_store.load(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != ProcessingStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Job not complete. Current status: {job.status.value}",
+        )
+
+    artifacts = job.artifacts
+    if not artifacts:
+        artifacts = await job_store.get_cached_artifacts(job_id)
+    if not artifacts:
+        raise HTTPException(status_code=404, detail="Artifacts not found")
+
+    payload = map_artifacts_to_jira(artifacts)
+
+    return JSONResponse(
+        content=payload.model_dump(),
+        headers={
+            "Content-Disposition": f'attachment; filename="meetolog_jira_export_{job_id}.json"',
+        },
+    )
+
 
 @app.get("/health")
 async def health_check():
     """
     Detailed health check for monitoring systems.
     
-    Checks:
-    - Redis connectivity
-    - ARQ worker queue status
     """
     redis_health = await check_redis_health()
     
@@ -401,14 +441,9 @@ async def health_check():
     }
 
 
-# =============================================================================
-# Entry Point for Direct Execution
-# =============================================================================
-
 if __name__ == "__main__":
     import uvicorn
     
-    # v2 supports horizontal scaling with multiple workers
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",

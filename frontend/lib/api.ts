@@ -2,13 +2,15 @@
  * API utilities for communicating with the Meetolog backend.
  */
 
+import type { JobStatus } from "@/types";
+
 const API_BASE = "/api";
 
 const BACKEND_DIRECT = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export interface JobResponse {
   job_id: string;
-  status: "pending" | "transcribing" | "extracting" | "generating_pdf" | "completed" | "failed";
+  status: JobStatus;
   message: string;
   progress: number;
   artifacts: MeetingArtifacts | null;
@@ -28,6 +30,7 @@ export interface MeetingArtifacts {
   decisions: Decision[];
   blockers: Blocker[];
   action_items: ActionItem[];
+  execution_tasks: ActionableTask[];
   transcript: string;
 }
 
@@ -40,6 +43,7 @@ export interface UserStory {
   acceptance_criteria: string[];
   priority: "low" | "medium" | "high" | "critical";
   story_points: number | null;
+  confidence_score?: number | null;
 }
 
 export interface Task {
@@ -50,6 +54,7 @@ export interface Task {
   priority: "low" | "medium" | "high" | "critical";
   status: "todo" | "in_progress" | "blocked" | "done";
   due_date: string | null;
+  confidence_score?: number | null;
 }
 
 export interface Decision {
@@ -59,6 +64,7 @@ export interface Decision {
   made_by: string | null;
   rationale: string;
   timestamp: string | null;
+  confidence_score?: number | null;
 }
 
 export interface Blocker {
@@ -68,6 +74,7 @@ export interface Blocker {
   affected_tasks: string[];
   owner: string | null;
   resolution_plan: string;
+  confidence_score?: number | null;
 }
 
 export interface ActionItem {
@@ -75,6 +82,17 @@ export interface ActionItem {
   description: string;
   assignee: string | null;
   due_date: string | null;
+  confidence_score?: number | null;
+}
+
+export interface ActionableTask {
+  title: string;
+  description: string;
+  owner_role: string;
+  priority: "High" | "Medium" | "Low";
+  task_source: "Explicit" | "Inferred";
+  dependencies: string[];
+  confidence_score?: number | null;
 }
 
 /**
@@ -124,6 +142,32 @@ export async function getJobStatus(jobId: string): Promise<JobResponse> {
 
 export function getPdfDownloadUrl(jobId: string): string {
   return `${BACKEND_DIRECT}/download/${jobId}`;
+}
+
+export function getJiraExportUrl(jobId: string): string {
+  return `${BACKEND_DIRECT}/export/jira/${jobId}`;
+}
+
+export async function updateArtifacts(
+  jobId: string,
+  artifacts: MeetingArtifacts,
+): Promise<JobResponse> {
+  const response = await fetch(`${BACKEND_DIRECT}/artifacts/${jobId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(artifacts),
+  });
+
+  if (!response.ok) {
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(error?.detail || `Failed to update artifacts (HTTP ${response.status})`);
+  }
+
+  const data = await safeJson<JobResponse>(response);
+  if (!data) {
+    throw new Error("Invalid response from server");
+  }
+  return data;
 }
 
 export function pollJobStatus(

@@ -1,22 +1,15 @@
 """
-Redis-backed Job Store for Meetolog v2.
+Redis-backed Job Store.
 
 Implements the JobStore interface using Redis Hashes for persistent
-job state storage. Features:
-
-- Redis Hash for job metadata (status, progress, step, error, etc.)
-- Separate keys for transcript and artifact caching
-- 7-day TTL with automatic refresh on reads
-- Pipeline caching for resumability
+job state storage with transcript/artifact caching and TTL expiry.
 
 Redis Key Schema:
-- job:{uuid}           - Hash with job metadata
-- job:{uuid}:transcript - String with cached transcript
-- job:{uuid}:artifacts  - JSON string with extracted artifacts
-- job:{uuid}:audio      - Compressed audio bytes (for restart resilience)
-- job:{uuid}:chunks     - Hash mapping chunk_index → transcript text
-
-See TECHNICAL_DESIGN_V2.md Section 2 for full schema details.
+- job:{uuid}            — Hash with job metadata
+- job:{uuid}:transcript — String with cached transcript
+- job:{uuid}:artifacts  — JSON string with extracted artifacts
+- job:{uuid}:audio      — Compressed audio bytes (restart resilience)
+- job:{uuid}:chunks     — Hash mapping chunk_index → transcript text
 """
 
 import logging
@@ -29,7 +22,7 @@ import ujson
 from redis.asyncio import Redis
 
 from ..interfaces import JobStore
-from ..models import JobResponse, ProcessingStatus, MeetingArtifacts
+from ..models import JobResponse, ProcessingStatus, MeetingArtifacts, parse_processing_status
 from ..config import get_settings
 from .redis import get_redis_pool
 
@@ -163,11 +156,8 @@ class RedisJobStore(JobStore):
             logger.debug(f"Job {job_id} not found in Redis")
             return None
         
-        # Parse status enum
-        try:
-            status = ProcessingStatus(data.get("status", "pending"))
-        except ValueError:
-            status = ProcessingStatus.PENDING
+        # Parse status enum (handles legacy "pending" / "processing" values)
+        status = parse_processing_status(data.get("status", "uploading"))
         
         # Load artifacts if cached
         artifacts = None
@@ -267,6 +257,43 @@ class RedisJobStore(JobStore):
         # Return updated job
         return await self.load(job_id)
     
+    async def update_job_stage(
+        self,
+        job_id: UUID | str,
+        status: ProcessingStatus,
+        progress: int,
+    ) -> None:
+        """Atomically update both *status* and *progress* in a single HSET.
+
+        Using a single ``HSET`` with a mapping guarantees the frontend
+        never reads a new status paired with a stale progress value.
+
+        Args:
+            job_id: The job identifier (UUID or string).
+            status: The new processing stage.
+            progress: Completion percentage (0-100).
+        """
+        redis = await self._get_redis()
+        key = self._job_key(job_id)
+        now = self._now_iso()
+
+        mapping: dict[str, str] = {
+            "status": status.value,
+            "progress": str(progress),
+            "updated_at": now,
+        }
+
+        # Track timing milestones
+        if status == ProcessingStatus.TRANSCRIBING:
+            mapping["started_at"] = now
+        elif status in (ProcessingStatus.COMPLETED, ProcessingStatus.FAILED):
+            mapping["completed_at"] = now
+
+        await redis.hset(key, mapping=mapping)
+        logger.debug(
+            f"Job {job_id} stage update: {status.value} @ {progress}%%"
+        )
+
     async def exists(self, job_id: UUID) -> bool:
         """Check if a job exists."""
         redis = await self._get_redis()
@@ -301,10 +328,6 @@ class RedisJobStore(JobStore):
         
         logger.warning(f"Attempted to delete non-existent job: {job_id}")
         return False
-    
-    # =========================================================================
-    # Caching Methods (for pipeline resumability)
-    # =========================================================================
     
     async def cache_transcript(self, job_id: UUID, transcript: str) -> None:
         """
@@ -399,6 +422,51 @@ class RedisJobStore(JobStore):
             logger.error(f"Failed to deserialize cached artifacts for {job_id}: {e}")
             return None
     
+    async def update_artifacts(self, job_id: UUID, artifacts: MeetingArtifacts) -> JobResponse:
+        """
+        Replace the artifacts payload for a completed job.
+
+        Overwrites the cached artifacts in Redis and marks `has_artifacts`.
+        The caller is responsible for validating that the job exists and is
+        in a COMPLETED state before invoking this method.
+
+        Args:
+            job_id: The job identifier
+            artifacts: The full replacement MeetingArtifacts object
+
+        Returns:
+            The refreshed JobResponse after the update
+
+        Raises:
+            ValueError: If the job does not exist in Redis
+        """
+        redis = await self._get_redis()
+        key = self._job_key(job_id)
+
+        if not await redis.exists(key):
+            raise ValueError(f"Job {job_id} not found")
+
+        # Overwrite the cached artifacts blob
+        await self.cache_artifacts(job_id, artifacts)
+
+        # Touch the job hash so updated_at reflects the edit
+        await redis.hset(
+            key,
+            mapping={
+                "has_artifacts": "1",
+                "updated_at": self._now_iso(),
+            },
+        )
+        await redis.expire(key, self._ttl_seconds)
+
+        logger.info(f"Artifacts updated for job {job_id}")
+
+        # Return the refreshed job
+        job = await self.load(job_id)
+        if job is None:
+            raise ValueError(f"Job {job_id} disappeared after update")
+        return job
+
     async def get_file_path(self, job_id: UUID) -> str | None:
         """
         Get the stored file path for a job.
@@ -480,7 +548,7 @@ class RedisJobStore(JobStore):
                 # Get job metadata
                 try:
                     metadata = await self.get_job_metadata(UUID(job_id))
-                    if metadata and metadata["status"] in ["transcribing", "extracting", "generating_pdf"]:
+                    if metadata and metadata["status"] in ["uploading", "transcribing", "extracting", "generating_pdf"]:
                         stale_jobs.append((job_id, metadata))
                 except Exception as e:
                     logger.error(f"Failed to parse job {key_str}: {e}")
@@ -510,10 +578,6 @@ class RedisJobStore(JobStore):
                 "completed_at": now,
             }
         )
-    
-    # =========================================================================
-    # Audio Storage (for restart resilience)
-    # =========================================================================
     
     async def store_audio(self, job_id: UUID, audio_bytes: bytes) -> bool:
         """
@@ -570,10 +634,6 @@ class RedisJobStore(JobStore):
         redis = await self._get_redis()
         await redis.delete(self._audio_key(job_id))
         logger.debug(f"Stored audio deleted for job {job_id}")
-    
-    # =========================================================================
-    # Chunk Transcript Storage (for incremental transcription)
-    # =========================================================================
     
     async def save_chunk_transcript(
         self, job_id: UUID, chunk_index: int, text: str, total_chunks: int

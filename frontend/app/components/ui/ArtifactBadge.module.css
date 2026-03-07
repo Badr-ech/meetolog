@@ -1,0 +1,57 @@
+/* =========================================================================
+   ArtifactBadge — small pill badge for Explicit / Inferred task sources
+   ConfidenceIndicator — colour-coded confidence score pill
+   ========================================================================= */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: nowrap;
+  user-select: none;
+  letter-spacing: 0.01em;
+}
+
+/* Explicit — subtle teal/blue-green */
+.explicit {
+  background: #e0f2fe;
+  color: #0369a1;
+}
+
+/* Inferred — subtle amber/purple */
+.inferred {
+  background: #f3e8ff;
+  color: #7c3aed;
+}
+
+/* Default / unknown — neutral gray */
+.default {
+  background: #f3f4f6;
+  color: #6b7280;
+}
+
+/* ---- Confidence indicator variants ---- */
+
+.confidenceHigh {
+  background: #dcfce7;
+  color: #166534;
+}
+
+.confidenceMedium {
+  background: #fef9c3;
+  color: #854d0e;
+}
+
+.confidenceLow {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.confidenceUnknown {
+  background: #f3f4f6;
+  color: #6b7280;
+}

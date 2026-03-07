@@ -1,13 +1,6 @@
 """
 Configuration management using Pydantic Settings.
 Loads environment variables securely with validation.
-
-Key Configuration (v2):
-- TEST_MODE: Enable mock services for CI/CD and testing
-- GEMINI_API_KEY: Google Gemini API key for LLM extraction
-- OPENAI_API_KEY: OpenAI API key for alternative LLM provider
-- LLM_PROVIDER: Which LLM provider to use (gemini, openai)
-- REDIS_URL: Redis connection URL for job state and queue
 """
 
 from functools import lru_cache
@@ -62,16 +55,8 @@ class Settings(BaseSettings):
         description="Whisper model size. 'tiny' for free tier, 'base' for better accuracy."
     )
     
-    # ==========================================================================
-    # Application Settings
-    # ==========================================================================
-    
     app_name: str = Field(default="Meetolog")
     debug: bool = Field(default=False)
-    
-    # ==========================================================================
-    # File Upload Settings
-    # ==========================================================================
     
     max_upload_size_mb: int = Field(
         default=100,
@@ -83,10 +68,6 @@ class Settings(BaseSettings):
     allowed_audio_extensions: list[str] = Field(
         default=[".mp3", ".wav", ".m4a", ".ogg", ".webm"]
     )
-    
-    # ==========================================================================
-    # Storage Directories
-    # ==========================================================================
     
     upload_dir: str = Field(
         default="uploads",
@@ -110,10 +91,6 @@ class Settings(BaseSettings):
         from pathlib import Path
         return str(Path(v).resolve())
     
-    # ==========================================================================
-    # Validators
-    # ==========================================================================
-    
     @field_validator("gemini_api_key", "openai_api_key", mode="before")
     @classmethod
     def strip_api_key(cls, v: str) -> str:
@@ -125,10 +102,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """
-    Cached settings instance to avoid reloading on every request.
-    
-    Returns:
-        Settings instance with validated configuration
-    """
+    """Cached settings instance."""
     return Settings()

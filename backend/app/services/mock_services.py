@@ -1,13 +1,7 @@
 """
 Mock implementations for testing and CI mode.
 
-These services provide deterministic, API-free behavior for:
-- Unit testing
-- CI/CD pipelines
-- Development without API keys
-- Demo environments
-
-All mocks return realistic but predictable data matching production schemas.
+Return deterministic, schema-compliant data without external API calls.
 """
 
 import asyncio
@@ -31,10 +25,6 @@ from ..models import (
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Mock Transcriber
-# =============================================================================
 
 class MockTranscriber(Transcriber):
     MOCK_TRANSCRIPT = """
@@ -121,10 +111,6 @@ Sarah: Perfect. Let's wrap up. Good meeting everyone!
         
         return '\n'.join(cleaned_lines)
 
-
-# =============================================================================
-# Mock LLM Extractor
-# =============================================================================
 
 class MockExtractor(LLMExtractor):
     """

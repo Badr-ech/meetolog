@@ -1,0 +1,73 @@
+/* JobProgress — stage-based progress indicator */
+
+.wrapper {
+  max-width: 600px;
+  margin: 0 auto 2rem;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.stageLabel {
+  font-weight: 500;
+  color: #374151;
+  font-size: 0.95rem;
+}
+
+.pct {
+  font-weight: 600;
+  color: #2563eb;
+  font-size: 0.95rem;
+}
+
+/* Stage dots */
+.stages {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 1rem;
+  gap: 0.25rem;
+}
+
+.stage {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  flex: 1;
+}
+
+.dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #e5e7eb;
+  margin-bottom: 0.35rem;
+  transition: background 0.3s ease;
+}
+
+.dotActive {
+  background: #2563eb;
+}
+
+.dotCompleted {
+  background: #16a34a;
+}
+
+.stageName {
+  font-size: 0.7rem;
+  color: #9ca3af;
+  text-align: center;
+  line-height: 1.2;
+}
+
+.stageNameActive {
+  color: #2563eb;
+  font-weight: 600;
+}
+
+.stageNameCompleted {
+  color: #16a34a;
+}

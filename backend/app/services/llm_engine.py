@@ -1,18 +1,9 @@
 """
-LLM Engine Abstraction Layer for Meetolog v2.
+LLM Engine Abstraction Layer.
 
-Provides a unified interface for multiple LLM providers:
-- Google Gemini (production, default)
-- OpenAI GPT-4 (alternative)
-
-Implements the Strategy Pattern with a factory function for
-runtime provider selection based on environment configuration.
-
-Usage:
-    from .llm_engine import get_llm_provider
-    
-    provider = get_llm_provider()
-    artifacts = await provider.extract_artifacts(transcript)
+Provides a unified interface for multiple LLM providers
+(Google Gemini, OpenAI GPT-4) using the Strategy Pattern with
+a factory function for runtime provider selection.
 """
 
 from __future__ import annotations
@@ -37,10 +28,6 @@ from ..models import (
 
 logger = logging.getLogger(__name__)
 
-
-# =============================================================================
-# Abstract Base Class
-# =============================================================================
 
 class LLMProvider(ABC):
     @property
@@ -242,10 +229,6 @@ Now analyze the transcript and return the JSON:"""
         return text
 
 
-# =============================================================================
-# Gemini Provider Implementation
-# =============================================================================
-
 class GeminiProvider(LLMProvider):
     """
     Google Gemini LLM provider for artifact extraction.
@@ -347,10 +330,6 @@ class GeminiProvider(LLMProvider):
             raise RuntimeError(f"Failed to extract artifacts: {e}") from e
 
 
-# =============================================================================
-# OpenAI Provider Implementation
-# =============================================================================
-
 class OpenAIProvider(LLMProvider):
     """
     OpenAI GPT-4 LLM provider for artifact extraction.
@@ -449,25 +428,11 @@ class OpenAIProvider(LLMProvider):
             raise RuntimeError(f"Failed to extract artifacts: {e}") from e
 
 
-# =============================================================================
-# Factory Function
-# =============================================================================
-
 def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExtractor":  # type: ignore[name-defined]
     """
-    Factory function to get the configured LLM provider.
-    
-    Selection logic:
-    1. If TEST_MODE=true → Returns MockExtractor (from mock_services)
-    2. If LLM_PROVIDER=openai and OPENAI_API_KEY set → OpenAIProvider
-    3. If LLM_PROVIDER=gemini and GEMINI_API_KEY set → GeminiProvider
-    4. Falls back to mock with warning if no API key
-    
-    Args:
-        settings: Optional settings instance. Uses get_settings() if not provided.
-        
-    Returns:
-        Configured LLMProvider instance (or MockExtractor for test mode)
+    Return the configured LLM provider based on settings.
+
+    Falls back to MockExtractor when no API key is available.
     """
     if settings is None:
         settings = get_settings()
@@ -485,7 +450,7 @@ def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExt
         if not settings.openai_api_key:
             from .mock_services import MockExtractor
             logger.warning(
-                "⚠️  OPENAI_API_KEY is not set! "
+                "OPENAI_API_KEY is not set. "
                 "Using MockExtractor. Set the API key for real extraction."
             )
             return MockExtractor(simulated_delay=0.3)
@@ -501,7 +466,7 @@ def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExt
     if not settings.gemini_api_key:
         from .mock_services import MockExtractor
         logger.warning(
-            "⚠️  GEMINI_API_KEY is not set! "
+            "GEMINI_API_KEY is not set. "
             "Using MockExtractor. Set the API key for real extraction."
         )
         return MockExtractor(simulated_delay=0.3)

@@ -26,6 +26,13 @@ from reportlab.platypus import (
 from ..models import MeetingArtifacts
 
 
+def _fmt_confidence(score: float | None) -> str:
+    """Format a confidence score for display, or 'N/A' when absent."""
+    if score is None:
+        return "N/A"
+    return f"{round(score * 100)}%"
+
+
 class PDFGeneratorService:
     def __init__(self, output_dir: Path):
         self.output_dir = output_dir
@@ -107,7 +114,7 @@ class PDFGeneratorService:
         
         # Title
         story.append(Paragraph(
-            f"📋 {artifacts.meeting_title}",
+            f"{artifacts.meeting_title}",
             self.styles['Title']
         ))
         story.append(Spacer(1, 12))
@@ -139,10 +146,11 @@ class PDFGeneratorService:
         
         # User Stories
         if artifacts.user_stories:
-            story.append(Paragraph("📖 User Stories", self.styles['SectionTitle']))
+            story.append(Paragraph("User Stories", self.styles['SectionTitle']))
             for i, us in enumerate(artifacts.user_stories, 1):
+                conf = _fmt_confidence(us.confidence_score)
                 story.append(Paragraph(
-                    f"{i}. {us.title} ({us.story_points or '?'} pts, {us.priority.value})",
+                    f"{i}. {us.title} ({us.story_points or '?'} pts, {us.priority.value}) | Confidence: {conf}",
                     self.styles['ItemTitle']
                 ))
                 story.append(Paragraph(
@@ -160,17 +168,18 @@ class PDFGeneratorService:
         
         # Tasks
         if artifacts.tasks:
-            story.append(Paragraph("✅ Tasks", self.styles['SectionTitle']))
-            task_data = [["Task", "Assignee", "Priority", "Due"]]
+            story.append(Paragraph("Tasks", self.styles['SectionTitle']))
+            task_data = [["Task", "Assignee", "Priority", "Confidence", "Due"]]
             for task in artifacts.tasks:
                 task_data.append([
                     task.title[:40] + "..." if len(task.title) > 40 else task.title,
                     task.assignee or "-",
                     task.priority.value.title(),
+                    _fmt_confidence(task.confidence_score),
                     task.due_date or "-",
                 ])
             
-            task_table = Table(task_data, colWidths=[3*inch, 1.2*inch, 0.9*inch, 1*inch])
+            task_table = Table(task_data, colWidths=[2.6*inch, 1*inch, 0.8*inch, 0.8*inch, 0.9*inch])
             task_table.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2563eb')),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
@@ -188,9 +197,10 @@ class PDFGeneratorService:
         
         # Decisions
         if artifacts.decisions:
-            story.append(Paragraph("🎯 Decisions", self.styles['SectionTitle']))
+            story.append(Paragraph("Decisions", self.styles['SectionTitle']))
             for d in artifacts.decisions:
-                story.append(Paragraph(f"• {d.title}", self.styles['ItemTitle']))
+                conf = _fmt_confidence(d.confidence_score)
+                story.append(Paragraph(f"• {d.title}  (Confidence: {conf})", self.styles['ItemTitle']))
                 story.append(Paragraph(d.description, self.styles['ItemDetail']))
                 if d.rationale:
                     story.append(Paragraph(
@@ -202,9 +212,10 @@ class PDFGeneratorService:
         
         # Blockers
         if artifacts.blockers:
-            story.append(Paragraph("🚧 Blockers", self.styles['SectionTitle']))
+            story.append(Paragraph("Blockers", self.styles['SectionTitle']))
             for b in artifacts.blockers:
-                story.append(Paragraph(f"• {b.title}", self.styles['ItemTitle']))
+                conf = _fmt_confidence(b.confidence_score)
+                story.append(Paragraph(f"• {b.title}  (Confidence: {conf})", self.styles['ItemTitle']))
                 story.append(Paragraph(b.description, self.styles['ItemDetail']))
                 if b.owner:
                     story.append(Paragraph(f"Owner: {b.owner}", self.styles['ItemDetail']))
@@ -218,12 +229,13 @@ class PDFGeneratorService:
         
         # Action Items
         if artifacts.action_items:
-            story.append(Paragraph("📌 Action Items", self.styles['SectionTitle']))
+            story.append(Paragraph("Action Items", self.styles['SectionTitle']))
             for a in artifacts.action_items:
                 assignee = f" ({a.assignee})" if a.assignee else ""
                 due = f" - Due: {a.due_date}" if a.due_date else ""
+                conf = _fmt_confidence(a.confidence_score)
                 story.append(Paragraph(
-                    f"• {a.description}{assignee}{due}",
+                    f"• {a.description}{assignee}{due} | Confidence: {conf}",
                     self.styles['Normal']
                 ))
             story.append(Spacer(1, 12))
@@ -231,11 +243,11 @@ class PDFGeneratorService:
         # Execution Tasks (appended last, on a new page)
         if artifacts.execution_tasks:
             story.append(PageBreak())
-            story.append(Paragraph("🚀 Execution Tasks", self.styles['SectionTitle']))
+            story.append(Paragraph("Execution Tasks", self.styles['SectionTitle']))
             story.append(Spacer(1, 8))
 
             # Table header
-            header_row = ["Status", "Title", "Owner", "Priority"]
+            header_row = ["Status", "Title", "Owner", "Priority", "Conf."]
             table_data = [header_row]
 
             for et in artifacts.execution_tasks:
@@ -252,11 +264,12 @@ class PDFGeneratorService:
                     Paragraph(title_text, self.styles['Normal']),
                     et.owner_role,
                     et.priority,
+                    _fmt_confidence(et.confidence_score),
                 ])
 
             exec_table = Table(
                 table_data,
-                colWidths=[0.5 * inch, 3.2 * inch, 1.3 * inch, 0.8 * inch],
+                colWidths=[0.5 * inch, 2.7 * inch, 1.1 * inch, 0.7 * inch, 0.7 * inch],
             )
             exec_table.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#7c3aed')),
@@ -279,8 +292,9 @@ class PDFGeneratorService:
             # Render descriptions below the table for readability
             for et in artifacts.execution_tasks:
                 source_tag = " (AI Inferred)" if et.task_source == "Inferred" else ""
+                conf = _fmt_confidence(et.confidence_score)
                 story.append(Paragraph(
-                    f"<b>{et.title}{source_tag}</b>",
+                    f"<b>{et.title}{source_tag}</b>  —  Confidence: {conf}",
                     self.styles['ItemTitle'],
                 ))
                 story.append(Paragraph(

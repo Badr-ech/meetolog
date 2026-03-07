@@ -1,12 +1,8 @@
 """
-Redis connection pool management for Meetolog v2.
+Redis connection pool management.
 
-Provides async Redis client with connection pooling for:
-- Job state persistence (RedisJobStore)
-- ARQ background queue
-- Transcript/artifact caching
-
-Uses redis-py async client with hiredis for performance.
+Provides an async Redis client with connection pooling for
+job state persistence, the ARQ background queue, and caching.
 """
 
 import logging
@@ -43,18 +39,7 @@ def _parse_redis_url(url: str) -> dict:
 
 
 async def get_redis_pool() -> Redis:
-    """
-    Get or create the global Redis async client.
-    
-    Uses connection pooling for efficiency. The pool is created
-    on first access and reused for all subsequent calls.
-    
-    Returns:
-        Async Redis client instance
-        
-    Raises:
-        ConnectionError: If Redis is unavailable
-    """
+    """Return the global async Redis client, creating it on first call."""
     global _redis_pool, _redis_client
     
     if _redis_client is not None:
@@ -113,15 +98,7 @@ async def close_redis_pool() -> None:
 
 @lru_cache
 def get_arq_redis_settings() -> RedisSettings:
-    """
-    Get ARQ-compatible Redis settings for worker configuration.
-    
-    ARQ uses its own RedisSettings class, so we parse our URL
-    into that format.
-    
-    Returns:
-        ARQ RedisSettings instance
-    """
+    """Parse REDIS_URL into ARQ-compatible RedisSettings."""
     settings = get_settings()
     params = _parse_redis_url(settings.redis_url)
     
@@ -146,12 +123,7 @@ def get_arq_redis_settings() -> RedisSettings:
 
 
 async def check_redis_health() -> dict:
-    """
-    Check Redis connection health.
-    
-    Returns:
-        Dict with connection status and info
-    """
+    """Return a dict with Redis connection status and server info."""
     try:
         redis = await get_redis_pool()
         info = await redis.info("server")

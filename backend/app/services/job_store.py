@@ -1,12 +1,8 @@
 """
-Local Job Store implementation using in-memory dict with optional file persistence.
+Local Job Store — in-memory dict with optional JSON file persistence.
 
-This implementation is designed for:
-- Single-instance deployments (MVP)
-- Development and testing
-- Easy debugging (human-readable JSON files)
-
-For production horizontal scaling, swap to RedisJobStore (Version 2).
+Suited for single-instance deployments and development.
+For production, use RedisJobStore.
 """
 
 import asyncio
