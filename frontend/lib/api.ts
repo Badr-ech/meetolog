@@ -6,8 +6,6 @@ import type { JobStatus } from "@/types";
 
 const API_BASE = "/api";
 
-const BACKEND_DIRECT = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-
 export interface JobResponse {
   job_id: string;
   status: JobStatus;
@@ -111,7 +109,7 @@ export async function uploadAudio(file: File): Promise<JobResponse> {
   const formData = new FormData();
   formData.append("file", file);
 
-  const response = await fetch(`${BACKEND_DIRECT}/upload`, {
+  const response = await fetch(`${API_BASE}/upload`, {
     method: "POST",
     body: formData,
   });
@@ -142,7 +140,7 @@ export async function getPresignedUploadUrl(
   fileType: string,
   fileSize: number,
 ): Promise<PresignedUploadData> {
-  const response = await fetch(`${BACKEND_DIRECT}/upload/presign`, {
+  const response = await fetch(`${API_BASE}/upload/presign`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ filename, file_type: fileType, file_size: fileSize }),
@@ -221,7 +219,7 @@ export async function enqueueJob(
   fileName: string,
   fileSize: number,
 ): Promise<JobResponse> {
-  const response = await fetch(`${BACKEND_DIRECT}/jobs/enqueue`, {
+  const response = await fetch(`${API_BASE}/jobs/enqueue`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ s3_key: s3Key, file_name: fileName, file_size: fileSize }),
@@ -254,18 +252,18 @@ export async function getJobStatus(jobId: string): Promise<JobResponse> {
 }
 
 export function getPdfDownloadUrl(jobId: string): string {
-  return `${BACKEND_DIRECT}/download/${jobId}`;
+  return `${API_BASE}/download/${jobId}`;
 }
 
 export function getJiraExportUrl(jobId: string): string {
-  return `${BACKEND_DIRECT}/export/jira/${jobId}`;
+  return `${API_BASE}/export/jira/${jobId}`;
 }
 
 export async function updateArtifacts(
   jobId: string,
   artifacts: MeetingArtifacts,
 ): Promise<JobResponse> {
-  const response = await fetch(`${BACKEND_DIRECT}/artifacts/${jobId}`, {
+  const response = await fetch(`${API_BASE}/artifacts/${jobId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(artifacts),

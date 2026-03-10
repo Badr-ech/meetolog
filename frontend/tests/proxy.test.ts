@@ -40,8 +40,8 @@ describe("next.config.js proxy rewrites", () => {
   });
 
   it("defaults backend URL to http://localhost:8000 when env is unset", () => {
-    const saved = process.env.NEXT_PUBLIC_API_URL;
-    delete process.env.NEXT_PUBLIC_API_URL;
+    const saved = process.env.API_URL;
+    delete process.env.API_URL;
 
     jest.resetModules();
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -55,14 +55,14 @@ describe("next.config.js proxy rewrites", () => {
       expect(apiRule!.destination).toMatch(/http:\/\/localhost:8000/);
 
       if (saved !== undefined) {
-        process.env.NEXT_PUBLIC_API_URL = saved;
+        process.env.API_URL = saved;
       }
     });
   });
 
-  it("uses NEXT_PUBLIC_API_URL when set", () => {
-    const saved = process.env.NEXT_PUBLIC_API_URL;
-    process.env.NEXT_PUBLIC_API_URL = "https://api.example.com";
+  it("uses API_URL when set", () => {
+    const saved = process.env.API_URL;
+    process.env.API_URL = "https://api.example.com";
 
     jest.resetModules();
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -76,9 +76,9 @@ describe("next.config.js proxy rewrites", () => {
       expect(apiRule!.destination).toMatch(/https:\/\/api\.example\.com/);
 
       if (saved !== undefined) {
-        process.env.NEXT_PUBLIC_API_URL = saved;
+        process.env.API_URL = saved;
       } else {
-        delete process.env.NEXT_PUBLIC_API_URL;
+        delete process.env.API_URL;
       }
     });
   });
