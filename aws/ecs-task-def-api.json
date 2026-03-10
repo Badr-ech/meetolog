@@ -1,0 +1,64 @@
+{
+  "family": "meetolog-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "meetolog-api",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/meetolog:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        { "name": "SERVICE_TYPE", "value": "web" },
+        { "name": "PORT", "value": "8000" },
+        { "name": "RUN_WORKER", "value": "false" },
+        { "name": "WHISPER_MODEL", "value": "tiny" },
+        { "name": "LLM_PROVIDER", "value": "gemini" },
+        { "name": "TEST_MODE", "value": "false" },
+        { "name": "AWS_REGION", "value": "<REGION>" }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/DATABASE_URL"
+        },
+        {
+          "name": "AWS_S3_BUCKET",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/AWS_S3_BUCKET"
+        },
+        {
+          "name": "GEMINI_API_KEY",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/GEMINI_API_KEY"
+        },
+        {
+          "name": "CORS_ORIGINS",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/CORS_ORIGINS"
+        }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/meetolog-api",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ]
+}

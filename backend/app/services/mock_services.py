@@ -7,6 +7,7 @@ Return deterministic, schema-compliant data without external API calls.
 import asyncio
 import logging
 from datetime import datetime
+from typing import Awaitable, Callable
 from pathlib import Path
 from uuid import uuid4
 
@@ -77,19 +78,17 @@ Sarah: Perfect. Let's wrap up. Good meeting everyone!
         self._delay = simulated_delay
         logger.info("MockTranscriber initialized (TEST_MODE)")
     
-    async def transcribe(self, audio_path: Path) -> str:
-        """
-        Return a mock transcript after a simulated delay.
+    async def transcribe(
+        self,
+        audio_path: Path,
+        progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+    ) -> str:
+        """Return a mock transcript after a simulated delay."""
+        logger.info("MockTranscriber: Simulating transcription for %s", audio_path)
         
-        The audio_path is validated but not actually processed.
-        """
-        logger.info(f"MockTranscriber: Simulating transcription for {audio_path}")
-        
-        # Validate file exists (even in mock mode, we should check)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
         
-        # Simulate processing time
         await asyncio.sleep(self._delay)
         
         logger.info("MockTranscriber: Returning mock transcript")

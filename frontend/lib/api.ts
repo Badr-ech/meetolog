@@ -124,6 +124,119 @@ export async function uploadAudio(file: File): Promise<JobResponse> {
   return response.json();
 }
 
+export interface PresignedUploadData {
+  url: string;
+  fields: Record<string, string>;
+  s3_key: string;
+}
+
+/**
+ * Request a presigned S3 POST payload for a direct browser-to-S3 upload.
+ *
+ * @param filename  Original filename as reported by the File API.
+ * @param fileType  MIME type of the file (e.g. `"audio/mpeg"`).
+ * @param fileSize  Byte length of the file.
+ */
+export async function getPresignedUploadUrl(
+  filename: string,
+  fileType: string,
+  fileSize: number,
+): Promise<PresignedUploadData> {
+  const response = await fetch(`${BACKEND_DIRECT}/upload/presign`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename, file_type: fileType, file_size: fileSize }),
+  });
+
+  if (!response.ok) {
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(error?.detail || `Failed to get upload URL (HTTP ${response.status})`);
+  }
+
+  const data = await safeJson<PresignedUploadData>(response);
+  if (!data) throw new Error("Invalid presign response from server");
+  return data;
+}
+
+/**
+ * Upload a file directly to S3 using a presigned POST payload.
+ *
+ * Progress events are emitted via `onProgress` as integer percentages (0–100).
+ * Uses `XMLHttpRequest` rather than `fetch` because the Fetch API does not
+ * expose granular upload progress.
+ *
+ * @param presignedUrl  The S3 endpoint URL from the presign response.
+ * @param fields        The pre-signed form fields that must precede the file.
+ * @param file          The audio file to upload.
+ * @param onProgress    Callback receiving the upload percentage (0–100).
+ */
+export function uploadToS3WithProgress(
+  presignedUrl: string,
+  fields: Record<string, string>,
+  file: File,
+  onProgress: (percent: number) => void,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const formData = new FormData();
+    for (const [key, value] of Object.entries(fields)) {
+      formData.append(key, value);
+    }
+    formData.append("file", file);
+
+    const xhr = new XMLHttpRequest();
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      if (xhr.status === 200 || xhr.status === 204) {
+        onProgress(100);
+        resolve();
+      } else {
+        reject(new Error(`S3 upload failed (HTTP ${xhr.status})`));
+      }
+    };
+
+    xhr.onerror = () => reject(new Error("S3 upload failed: network error"));
+    xhr.onabort = () => reject(new Error("S3 upload aborted"));
+
+    xhr.open("POST", presignedUrl);
+    xhr.send(formData);
+  });
+}
+
+/**
+ * Notify the backend to enqueue a transcription job for a file already
+ * uploaded to S3 via the presigned POST flow.
+ *
+ * @param s3Key    The S3 object key returned by `POST /upload/presign`.
+ * @param fileName Original filename for metadata storage.
+ * @param fileSize File size in bytes.
+ */
+export async function enqueueJob(
+  s3Key: string,
+  fileName: string,
+  fileSize: number,
+): Promise<JobResponse> {
+  const response = await fetch(`${BACKEND_DIRECT}/jobs/enqueue`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ s3_key: s3Key, file_name: fileName, file_size: fileSize }),
+  });
+
+  if (!response.ok) {
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(error?.detail || `Failed to enqueue job (HTTP ${response.status})`);
+  }
+
+  const data = await safeJson<JobResponse>(response);
+  if (!data) throw new Error("Invalid enqueue response from server");
+  return data;
+}
+
 export async function getJobStatus(jobId: string): Promise<JobResponse> {
   // Use Vercel proxy to avoid CORS issues when backend is down (502/503 don't include CORS headers)
   const response = await fetch(`${API_BASE}/status/${jobId}`);

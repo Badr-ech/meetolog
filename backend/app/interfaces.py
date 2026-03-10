@@ -7,7 +7,7 @@ dependency injection and test mocking.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from uuid import UUID
 
 from .models import JobResponse, MeetingArtifacts, ProcessingStatus
@@ -50,7 +50,11 @@ class Transcriber(ABC):
     """Abstract interface for speech-to-text transcription."""
     
     @abstractmethod
-    async def transcribe(self, audio_path: Path) -> str:
+    async def transcribe(
+        self,
+        audio_path: Path,
+        progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+    ) -> str:
         """
         Transcribe an audio file to text.
         

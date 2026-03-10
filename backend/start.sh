@@ -2,11 +2,11 @@
 # =============================================================================
 # Meetolog – Container Entrypoint
 #
-# Launches either the FastAPI web server or the ARQ worker based on the
-# SERVICE_TYPE environment variable.
+# Launches either the FastAPI web server or the Postgres-polling background
+# worker based on the SERVICE_TYPE environment variable.
 #
 #   SERVICE_TYPE=web     →  uvicorn  (default)
-#   SERVICE_TYPE=worker  →  arq
+#   SERVICE_TYPE=worker  →  python -m app.worker
 # =============================================================================
 
 set -euo pipefail
@@ -19,12 +19,11 @@ echo "=========================================="
 echo " Meetolog – Starting service: ${SERVICE_TYPE}"
 echo "=========================================="
 
-# If RUN_WORKER=true, start the ARQ worker in the background
-# alongside the main service (used on Render where the API
-# and worker share a single persistent disk).
+# If RUN_WORKER=true, start the background worker alongside the API
+# (used for single-container deployments).
 if [ "${RUN_WORKER}" = "true" ] && [ "${SERVICE_TYPE}" = "web" ]; then
-    echo "→ Starting ARQ worker in background (RUN_WORKER=true)..."
-    arq app.worker.WorkerSettings &
+    echo "→ Starting background worker in background (RUN_WORKER=true)..."
+    python -m app.worker &
     sleep 2
 fi
 
@@ -38,8 +37,8 @@ case "${SERVICE_TYPE}" in
             --log-level info
         ;;
     worker)
-        echo "→ Launching ARQ worker..."
-        exec arq app.worker.WorkerSettings
+        echo "→ Launching background worker..."
+        exec python -m app.worker
         ;;
     *)
         echo "ERROR: Unknown SERVICE_TYPE '${SERVICE_TYPE}'."

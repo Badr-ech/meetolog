@@ -12,25 +12,22 @@ from pathlib import Path
 from typing import Annotated
 from uuid import UUID, uuid4
 
-import aiofiles
-from arq import create_pool
-from arq.connections import ArqRedis
 from fastapi import FastAPI, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .models import JobResponse, ProcessingStatus, MeetingArtifacts
-from .infrastructure.redis import (
-    get_redis_pool,
-    close_redis_pool,
-    get_arq_redis_settings,
-    check_redis_health,
-)
-from .infrastructure.job_store import RedisJobStore
+from .models.metadata import FileMetadata
+from .models.db_models import JobRecord
+from .infrastructure.db import get_async_session, init_db, close_db
+from .infrastructure.postgres_job_store import PostgresJobStore
+from .infrastructure.postgres_queue import PostgresJobQueue
 from .services.jira_mapper import map_artifacts_to_jira
+from .services.storage import S3StorageService
 
 # Configure logging
 logging.basicConfig(
@@ -43,72 +40,61 @@ logger = logging.getLogger(__name__)
 # Initialize settings
 settings = get_settings()
 
-# ARQ connection pool (singleton)
-_arq_pool: ArqRedis | None = None
+# S3 storage service (singleton)
+_s3_service: S3StorageService | None = None
 
 
-async def get_job_store() -> RedisJobStore:
-    redis = await get_redis_pool()
-    return RedisJobStore(redis)
+def get_s3_service() -> S3StorageService:
+    """Return the global S3StorageService, creating it on first call."""
+    global _s3_service
+    if _s3_service is None:
+        _s3_service = S3StorageService()
+    return _s3_service
 
 
-async def get_arq_pool() -> ArqRedis:
-    global _arq_pool
-    
-    if _arq_pool is None:
-        _arq_pool = await create_pool(get_arq_redis_settings())
-        logger.info("ARQ connection pool created")
-    
-    return _arq_pool
+async def get_job_store(
+    session: AsyncSession = Depends(get_async_session),
+) -> PostgresJobStore:
+    return PostgresJobStore(session)
 
 
-# Type alias for cleaner endpoint signatures
-JobStoreDep = Annotated[RedisJobStore, Depends(get_job_store)]
+async def get_job_queue(
+    session: AsyncSession = Depends(get_async_session),
+) -> PostgresJobQueue:
+    return PostgresJobQueue(session)
+
+
+# Type aliases for cleaner endpoint signatures
+JobStoreDep = Annotated[PostgresJobStore, Depends(get_job_store)]
+JobQueueDep = Annotated[PostgresJobQueue, Depends(get_job_queue)]
+DBSessionDep = Annotated[AsyncSession, Depends(get_async_session)]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _arq_pool
-    
     # Startup
     logger.info("Starting Meetolog API...")
-    
-    # Initialize Redis
-    try:
-        redis = await get_redis_pool()
-        logger.info("Redis connection established")
-    except Exception as e:
-        logger.error(f"Failed to connect to Redis: {e}")
-        logger.warning("API starting without Redis - endpoints may fail")
-    
-    # Initialize ARQ pool
-    try:
-        _arq_pool = await create_pool(get_arq_redis_settings())
-        logger.info("ARQ connection pool created")
-    except Exception as e:
-        logger.error(f"Failed to create ARQ pool: {e}")
-        logger.warning("API starting without ARQ - job enqueueing will fail")
-    
-    # Ensure directories exist
-    Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
-    Path(settings.output_dir).mkdir(parents=True, exist_ok=True)
-    
-    logger.info(f"Upload directory: {settings.upload_dir}")
-    logger.info(f"Output directory: {settings.output_dir}")
+
+    # Initialize PostgreSQL and create tables
+    if settings.database_url:
+        try:
+            await init_db()
+            logger.info("PostgreSQL database initialised")
+        except Exception as e:
+            logger.error(f"Failed to initialise database: {e}")
+            logger.warning("API starting without PostgreSQL")
+    else:
+        logger.warning("DATABASE_URL not set — job persistence unavailable")
+
+    logger.info(f"S3 bucket: {settings.aws_s3_bucket or '(not configured)'}")
     logger.info(f"LLM Provider: {settings.llm_provider}")
     logger.info(f"Test Mode: {settings.test_mode}")
-    
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down Meetolog API...")
-    
-    if _arq_pool is not None:
-        await _arq_pool.close()
-        _arq_pool = None
-    
-    await close_redis_pool()
-    
+    await close_db()
     logger.info("Shutdown complete")
 
 
@@ -116,7 +102,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Meetolog API",
     description="Transform meeting recordings into structured Agile artifacts",
-    version="2.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -133,44 +119,153 @@ app.add_middleware(
 )
 
 
-def get_upload_dir() -> Path:
-    upload_dir = Path(settings.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    return upload_dir
+# ---------------------------------------------------------------------------
+# Request / response schemas for the presigned upload flow
+# ---------------------------------------------------------------------------
+
+
+class PresignRequest(BaseModel):
+    filename: str
+    file_type: str
+    file_size: int = Field(..., gt=0, description="Declared file size in bytes")
+
+
+class PresignResponse(BaseModel):
+    url: str
+    fields: dict[str, str]
+    s3_key: str
+
+
+class EnqueueRequest(BaseModel):
+    s3_key: str = Field(..., description="S3 object key returned by /upload/presign")
+    file_name: str = Field(..., description="Original filename for metadata storage")
+    file_size: int = Field(..., gt=0, description="File size in bytes")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 
 
 @app.get("/")
 async def root():
-    redis_health = await check_redis_health()
-    
     return {
         "service": "Meetolog API",
-        "version": "2.0.0",
-        "status": "healthy" if redis_health["status"] == "healthy" else "degraded",
+        "version": "3.0.0",
+        "status": "healthy",
         "test_mode": settings.test_mode,
         "llm_provider": settings.llm_provider,
-        "redis": redis_health,
     }
+
+
+@app.post("/upload/presign", response_model=PresignResponse)
+async def presign_upload(body: PresignRequest):
+    """
+    Generate a presigned S3 POST URL for direct browser-to-S3 audio upload.
+
+    The client should:
+    1. POST file metadata here to receive ``url``, ``fields``, and ``s3_key``.
+    2. Build a ``multipart/form-data`` body with the returned fields appended
+       first, then the ``file`` field last, and POST it to ``url``.
+    3. On HTTP 200/204 from S3, call ``POST /jobs/enqueue`` with ``s3_key`` to
+       trigger the transcription pipeline.
+
+    - 400 if the MIME type is not an accepted audio format.
+    - 400 if the declared file size is outside the permitted range.
+    - 503 if the S3 service is unreachable or credentials are invalid.
+    """
+    if not settings.aws_s3_bucket:
+        raise HTTPException(
+            status_code=503,
+            detail="S3 storage is not configured on this server.",
+        )
+
+    s3 = get_s3_service()
+    try:
+        result = await s3.generate_upload_presigned_post(
+            filename=body.filename,
+            file_type=body.file_type,
+            file_size=body.file_size,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        logger.error("Presign generation failed: %s", exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Failed to generate upload URL. Please try again later.",
+        )
+
+    return PresignResponse(**result)
+
+
+@app.post("/jobs/enqueue", response_model=JobResponse)
+async def enqueue_job(
+    body: EnqueueRequest,
+    queue: JobQueueDep,
+    db: DBSessionDep,
+):
+    """
+    Enqueue a transcription job for an audio file already uploaded to S3.
+
+    Inserts a row into the ``job_records`` table with ``pending`` status.
+    A background worker polling the table will pick it up.
+
+    - 400 if ``s3_key`` does not begin with the expected ``uploads/`` prefix.
+    """
+    if not body.s3_key.startswith("uploads/"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid s3_key: must reference an object in the uploads/ prefix.",
+        )
+
+    safe_file_name = Path(body.file_name).name
+    job_id = uuid4()
+
+    # Persist file metadata in PostgreSQL
+    if settings.database_url:
+        metadata_record = FileMetadata(
+            job_id=str(job_id),
+            s3_key=body.s3_key,
+            original_filename=safe_file_name,
+            file_size_bytes=body.file_size,
+        )
+        db.add(metadata_record)
+        await db.commit()
+
+    # Insert job into the persistent Postgres queue
+    record = await queue.enqueue_job(
+        job_id=job_id,
+        s3_key=body.s3_key,
+        file_name=safe_file_name,
+        file_size=body.file_size,
+    )
+    logger.info("Job %s enqueued to Postgres queue", job_id)
+
+    return JobResponse(
+        job_id=record.id,
+        status=ProcessingStatus.UPLOADING,
+        message=record.message,
+        progress=record.progress,
+    )
 
 
 @app.post("/upload", response_model=JobResponse)
 async def upload_audio(
     file: UploadFile,
-    job_store: JobStoreDep,
+    queue: JobQueueDep,
+    db: DBSessionDep,
 ):
     """
     Upload an audio file for processing.
-    
-    Accepts audio files (mp3, wav, m4a, ogg, webm) and enqueues
-    a background job for processing.
-    
-    Returns a job ID to track processing status.
-    
+
+    Streams the file directly to S3 (no local storage), persists
+    metadata in PostgreSQL, and inserts a job into the Postgres queue.
     """
     # Validate file type
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
-    
+
     file_ext = Path(file.filename).suffix.lower()
     if file_ext not in settings.allowed_audio_extensions:
         raise HTTPException(
@@ -178,83 +273,61 @@ async def upload_audio(
             detail=f"Unsupported file type: {file_ext}. "
                    f"Allowed: {settings.allowed_audio_extensions}",
         )
-    
+
     # Validate file size
     file.file.seek(0, 2)  # Seek to end
     file_size = file.file.tell()
     size_mb = file_size / (1024 * 1024)
     file.file.seek(0)  # Reset
-    
+
     if size_mb > settings.max_upload_size_mb:
         raise HTTPException(
             status_code=400,
             detail=f"File too large: {size_mb:.1f}MB. Max: {settings.max_upload_size_mb}MB",
         )
-    
-    # Generate job ID and save file
+
+    # Generate job ID and S3 key
     job_id = uuid4()
-    upload_dir = get_upload_dir()
-    audio_path = upload_dir / f"{job_id}{file_ext}"
-    
-    # Save file asynchronously
-    content = await file.read()
-    async with aiofiles.open(audio_path, "wb") as f:
-        await f.write(content)
-    
-    logger.info(f"File uploaded: {file.filename} -> {audio_path} ({size_mb:.2f} MB)")
-    
-    # Create job record in Redis with UPLOADING status
-    job = JobResponse(
-        job_id=job_id,
-        status=ProcessingStatus.UPLOADING,
-        message="Job queued for processing",
-        progress=0,
+    s3_key = f"uploads/{job_id}{file_ext}"
+
+    # Stream upload to S3
+    s3 = get_s3_service()
+    try:
+        await s3.upload_stream(file.file, s3_key)
+    except Exception as e:
+        logger.error(f"S3 upload failed for job {job_id}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to upload file to storage. Please try again later.",
+        )
+
+    logger.info(f"File uploaded to S3: {file.filename} -> {s3_key} ({size_mb:.2f} MB)")
+
+    # Persist file metadata in PostgreSQL
+    metadata_record = FileMetadata(
+        job_id=str(job_id),
+        s3_key=s3_key,
+        original_filename=file.filename,
+        file_size_bytes=file_size,
     )
-    
-    await job_store.save(
-        job_id,
-        job,
-        file_path=str(audio_path),
+    db.add(metadata_record)
+    await db.commit()
+
+    # Insert job into the persistent Postgres queue
+    record = await queue.enqueue_job(
+        job_id=job_id,
+        s3_key=s3_key,
         file_name=file.filename,
         file_size=file_size,
     )
-    
-    # Enqueue job to ARQ worker
-    try:
-        arq_pool = await get_arq_pool()
-        
-        arq_job = await arq_pool.enqueue_job(
-            "process_audio_job",
-            job_id=str(job_id),
-            file_path=str(audio_path),
-            file_name=file.filename,
-            file_size=file_size,
-            _job_id=str(job_id),  # Use our job_id as ARQ job_id
-        )
-        
-        logger.info(f"Job {job_id} enqueued to ARQ (arq_job_id: {arq_job.job_id})")
-        
-    except Exception as e:
-        logger.error(f"Failed to enqueue job {job_id}: {e}")
-        
-        # Update job status to failed
-        await job_store.update(
-            job_id,
-            status=ProcessingStatus.FAILED,
-            error=f"Failed to enqueue job: {e}",
-            message="Job enqueueing failed",
-        )
-        
-        # Clean up uploaded file
-        if audio_path.exists():
-            audio_path.unlink()
-        
-        raise HTTPException(
-            status_code=503,
-            detail="Job queue unavailable. Please try again later.",
-        )
-    
-    return job
+    logger.info("Job %s enqueued to Postgres queue", job_id)
+
+    return JobResponse(
+        job_id=record.id,
+        status=ProcessingStatus.UPLOADING,
+        message=record.message,
+        progress=record.progress,
+    )
 
 
 @app.get("/status/{job_id}", response_model=JobResponse)
@@ -274,32 +347,40 @@ async def get_job_status(job_id: UUID, job_store: JobStoreDep):
 
 
 @app.get("/download/{job_id}")
-async def download_pdf(job_id: UUID, job_store: JobStoreDep):
+async def download_pdf(
+    job_id: UUID,
+    job_store: JobStoreDep,
+    session: Annotated[AsyncSession, Depends(get_async_session)],
+):
     """
     Download the generated PDF summary for a completed job.
-    
+
+    Redirects the client to a short-lived presigned S3 URL for the PDF.
     """
     job = await job_store.load(job_id)
-    
+
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     if job.status != ProcessingStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
             detail=f"Job not complete. Current status: {job.status.value}",
         )
-    
-    pdf_path = Path(settings.output_dir) / f"meeting_{job_id}.pdf"
-    
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="PDF file not found")
-    
-    return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
-        filename=f"meeting_summary_{job_id}.pdf",
+
+    # Prefer S3 when the worker has stored a pdf_s3_key
+    result = await session.execute(
+        select(JobRecord.pdf_s3_key).where(JobRecord.id == job_id)
     )
+    pdf_s3_key = result.scalar_one_or_none()
+
+    if pdf_s3_key:
+        s3 = get_s3_service()
+        presigned_url = await s3.generate_presigned_get_url(pdf_s3_key, expires_in=3600)
+        return RedirectResponse(url=presigned_url, status_code=307)
+
+    # No S3 key means the PDF was never uploaded
+    raise HTTPException(status_code=404, detail="PDF file not found")
 
 
 @app.put("/artifacts/{job_id}", response_model=JobResponse)
@@ -401,42 +482,48 @@ async def export_jira(job_id: UUID, job_store: JobStoreDep):
 
 
 @app.get("/health")
-async def health_check():
+async def health_check(
+    db: DBSessionDep,
+):
     """
     Detailed health check for monitoring systems.
-    
+
+    Reports database connectivity and the number of pending/processing jobs.
     """
-    redis_health = await check_redis_health()
-    
-    # Check if ARQ pool is connected
-    arq_status = "unknown"
+    db_status = "healthy"
+    pending = 0
+    processing = 0
     try:
-        arq_pool = await get_arq_pool()
-        # Check queue length (ARQ default queue key)
-        redis = await get_redis_pool()
-        queue_len = await redis.llen("arq:queue")
-        arq_status = "healthy"
-    except Exception as e:
-        arq_status = f"unhealthy: {e}"
-        queue_len = -1
-    
-    overall_status = "healthy"
-    if redis_health["status"] != "healthy" or arq_status != "healthy":
-        overall_status = "degraded"
-    
+        row = (
+            await db.execute(
+                select(
+                    func.count()
+                    .filter(JobRecord.status == "pending")
+                    .label("pending"),
+                    func.count()
+                    .filter(JobRecord.status == "processing")
+                    .label("processing"),
+                )
+            )
+        ).one()
+        pending, processing = row.pending, row.processing
+    except Exception as exc:
+        db_status = f"unhealthy: {exc}"
+
+    overall = "healthy" if db_status == "healthy" else "degraded"
+
     return {
-        "status": overall_status,
+        "status": overall,
         "components": {
-            "redis": redis_health,
-            "arq": {
-                "status": arq_status,
-                "queue_length": queue_len,
+            "database": {
+                "status": db_status,
+                "pending_jobs": pending,
+                "processing_jobs": processing,
             },
         },
         "config": {
             "test_mode": settings.test_mode,
             "llm_provider": settings.llm_provider,
-            "redis_url": settings.redis_url.split("@")[-1] if "@" in settings.redis_url else settings.redis_url,  # Hide password
         },
     }
 

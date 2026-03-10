@@ -25,6 +25,7 @@ from ..models import (
     ActionItem,
     Priority,
 )
+from ..models.schemas import ActionableTask
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ INSTRUCTIONS:
 7. Estimate story points for user stories using Fibonacci sequence (1, 2, 3, 5, 8, 13)
 8. Assign priorities based on context and urgency (low, medium, high, critical)
 9. Generate a concise 2-3 sentence summary of the meeting
+10. Identify EXECUTION TASKS — both explicit tasks directly stated and inferred tasks logically implied by the discussion. Tag each as "Explicit" or "Inferred" with a confidence score.
 
 CRITICAL: Return ONLY valid JSON with no additional text, markdown formatting, or explanation.
 The response must be parseable by json.loads() directly.
@@ -126,6 +128,17 @@ Required JSON structure:
             "description": "string - what needs to be done",
             "assignee": "name or null",
             "due_date": "string or null"
+        }}
+    ],
+    "execution_tasks": [
+        {{
+            "title": "string - concise task title",
+            "description": "string - detailed description of work required",
+            "owner_role": "string - responsible role (e.g., Engineering, Design, Product) or specific name",
+            "priority": "High|Medium|Low",
+            "task_source": "Explicit|Inferred",
+            "dependencies": ["list of other tasks or conditions this depends on"],
+            "confidence_score": 0.0 to 1.0 or null
         }}
     ]
 }}
@@ -201,6 +214,19 @@ Now analyze the transcript and return the JSON:"""
             for a in data.get("action_items", [])
         ]
         
+        execution_tasks = [
+            ActionableTask(
+                title=et.get("title", ""),
+                description=et.get("description", ""),
+                owner_role=et.get("owner_role", "Engineering"),
+                priority=et.get("priority", "Medium"),
+                task_source=et.get("task_source", "Inferred"),
+                dependencies=et.get("dependencies", []),
+                confidence_score=et.get("confidence_score"),
+            )
+            for et in data.get("execution_tasks", [])
+        ]
+        
         return MeetingArtifacts(
             meeting_title=data.get("meeting_title", "Meeting"),
             meeting_date=datetime.now(),
@@ -211,6 +237,7 @@ Now analyze the transcript and return the JSON:"""
             decisions=decisions,
             blockers=blockers,
             action_items=action_items,
+            execution_tasks=execution_tasks,
             transcript=transcript,
         )
     

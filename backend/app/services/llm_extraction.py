@@ -7,8 +7,15 @@ Implements the LLMExtractor interface for dependency injection.
 
 import asyncio
 import json
-import logging
 from datetime import datetime
+
+import structlog
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from ..interfaces import LLMExtractor
 from ..models import (
@@ -23,7 +30,13 @@ from ..models import (
 )
 from .heuristics import calculate_artifact_confidence
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
+
+# Timeout for a single LLM API call (seconds).
+LLM_CALL_TIMEOUT_SECONDS = 60
+
+# Transient errors worth retrying.
+_LLM_RETRYABLE = (ConnectionError, TimeoutError, asyncio.TimeoutError)
 
 # Lazy import google.generativeai to allow mock mode without API key
 _genai = None
@@ -64,10 +77,10 @@ class GeminiExtractor(LLMExtractor):
     def _get_model(self):
         if self._model is None:
             genai = _get_genai()
-            logger.info("Initializing Gemini model")
+            logger.info("gemini_model_init")
             genai.configure(api_key=self.api_key)
             self._model = genai.GenerativeModel("gemini-2.5-flash-lite")
-            logger.info("Gemini model initialized successfully")
+            logger.info("gemini_model_ready")
         return self._model
     
     def _build_extraction_prompt(self, transcript: str) -> str:
@@ -192,19 +205,11 @@ Now analyze the transcript and return the JSON:"""
         prompt = self._build_extraction_prompt(transcript)
         
         try:
-            logger.info("Calling Gemini API for artifact extraction")
+            logger.info("llm_extraction_start")
             
             genai = _get_genai()
             
-            # Call Gemini API in thread pool to not block async
-            response = await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,  # Low temperature for consistent extraction
-                    max_output_tokens=4096,
-                )
-            )
+            response = await self._call_llm_with_retry(model, prompt, genai)
             
             if not response or not response.text:
                 raise RuntimeError("Gemini API returned empty response")
@@ -226,12 +231,30 @@ Now analyze the transcript and return the JSON:"""
                 logger.error(f"Raw response: {json_text[:500]}...")
                 raise RuntimeError(f"Failed to parse LLM response as JSON: {e}") from e
             
-            logger.info("Successfully extracted artifacts from transcript")
+            logger.info("llm_extraction_success")
             return self._parse_extraction(extracted, transcript)
             
         except Exception as e:
-            logger.error(f"LLM extraction failed: {e}")
+            logger.error("llm_extraction_failed", error=str(e))
             raise RuntimeError(f"Failed to extract artifacts: {e}") from e
+    
+    @retry(
+        retry=retry_if_exception_type(_LLM_RETRYABLE),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _call_llm_with_retry(self, model, prompt: str, genai):
+        """Call the Gemini API with retry and timeout protection."""
+        async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
+            return await asyncio.to_thread(
+                model.generate_content,
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.2,
+                    max_output_tokens=4096,
+                ),
+            )
     
     # -----------------------------------------------------------------
     # Helpers

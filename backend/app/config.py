@@ -23,18 +23,6 @@ class Settings(BaseSettings):
         description="Enable test mode with mock services (no external API calls)"
     )
     
-    redis_url: str = Field(
-        default="redis://localhost:6379",
-        description="Redis connection URL for job state and queue"
-    )
-    
-    redis_job_ttl_days: int = Field(
-        default=7,
-        ge=1,
-        le=30,
-        description="TTL in days for job data in Redis"
-    )
-    
     llm_provider: Literal["gemini", "openai"] = Field(
         default="gemini",
         description="LLM provider to use for artifact extraction"
@@ -69,27 +57,49 @@ class Settings(BaseSettings):
         default=[".mp3", ".wav", ".m4a", ".ogg", ".webm"]
     )
     
-    upload_dir: str = Field(
-        default="uploads",
-        description="Directory for temporary uploaded files"
-    )
-    
-    output_dir: str = Field(
-        default="outputs",
-        description="Directory for generated PDFs and job state"
-    )
-    
     cors_origins: str = Field(
         default="http://localhost:3000,http://127.0.0.1:3000",
         description="Comma-separated list of allowed CORS origins"
     )
     
-    @field_validator("upload_dir", "output_dir", mode="after")
+    # AWS S3 configuration
+    aws_access_key_id: str = Field(
+        default="",
+        description="AWS access key ID for S3"
+    )
+    aws_secret_access_key: str = Field(
+        default="",
+        description="AWS secret access key for S3"
+    )
+    aws_region: str = Field(
+        default="us-east-1",
+        description="AWS region for S3 bucket"
+    )
+    aws_s3_bucket: str = Field(
+        default="",
+        description="S3 bucket name for audio file storage"
+    )
+    aws_endpoint_url: str | None = Field(
+        default=None,
+        description="Custom S3 endpoint URL (e.g. http://minio:9000 for local MinIO)"
+    )
+    aws_public_endpoint_url: str | None = Field(
+        default=None,
+        description="Public S3 endpoint URL for browser-facing presigned URLs (e.g. http://localhost:9000)"
+    )
+    
+    # PostgreSQL configuration
+    database_url: str = Field(
+        default="",
+        description="Async PostgreSQL connection URL (postgresql+asyncpg://...)"
+    )
+
+    @field_validator("database_url", mode="after")
     @classmethod
-    def resolve_to_absolute(cls, v: str) -> str:
-        """Resolve relative paths to absolute paths based on cwd."""
-        from pathlib import Path
-        return str(Path(v).resolve())
+    def normalize_database_url(cls, v: str) -> str:
+        if v.startswith("postgresql://"):
+            return v.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return v
     
     @field_validator("gemini_api_key", "openai_api_key", mode="before")
     @classmethod

@@ -17,6 +17,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class AudioSplitError(RuntimeError):
+    """Raised when ffmpeg fails to split an audio file into chunks."""
+
+
 def get_audio_duration(audio_path: Path) -> float:
     """Return audio duration in seconds using ``ffprobe``.
 
@@ -40,7 +44,7 @@ def get_audio_duration(audio_path: Path) -> float:
         )
         return float(result.stdout.strip())
     except Exception as e:
-        logger.warning(f"Could not probe audio duration: {e}")
+        logger.warning("Could not probe audio duration: %s", e)
         return 0.0
 
 
@@ -49,7 +53,7 @@ def split_audio_into_chunks(
     chunk_dir: Path,
     chunk_duration_seconds: int = 300,
 ) -> list[Path]:
-    """Split an audio file into fixed-duration chunks using ``ffmpeg``.
+    """Split an audio file into fixed-duration chunks using the ffmpeg segment muxer.
 
     Chunks are written to *chunk_dir* as 16 kHz mono WAV files (Whisper's
     native format).  No chunk data is held in memory — only file paths.
@@ -64,15 +68,20 @@ def split_audio_into_chunks(
         List of chunk file paths, ordered chronologically.
 
     Raises:
-        RuntimeError: If the ``ffmpeg`` command exits with a non-zero code.
+        AudioSplitError: If ``ffmpeg`` exits with a non-zero code or times out.
+        FileNotFoundError: If *audio_path* does not exist.
     """
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Source audio not found: {audio_path}")
+
     chunk_dir.mkdir(parents=True, exist_ok=True)
     stem = audio_path.stem
 
     chunk_pattern = str(chunk_dir / f"{stem}_chunk_%03d.wav")
 
     cmd = [
-        "ffmpeg", "-y", "-i", str(audio_path),
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
         "-f", "segment",
         "-segment_time", str(chunk_duration_seconds),
         "-ar", "16000",   # Whisper native sample rate
@@ -81,14 +90,33 @@ def split_audio_into_chunks(
         chunk_pattern,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AudioSplitError(
+            f"ffmpeg timed out splitting {audio_path.name}"
+        ) from exc
 
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg chunk split failed: {result.stderr[:500]}")
+        stderr_snippet = (result.stderr or "")[:500]
+        raise AudioSplitError(
+            f"ffmpeg segment split failed (rc={result.returncode}): {stderr_snippet}"
+        )
 
     chunks = sorted(chunk_dir.glob(f"{stem}_chunk_*.wav"))
+
+    if not chunks:
+        raise AudioSplitError(
+            "ffmpeg exited successfully but produced zero chunk files"
+        )
+
     logger.info(
-        f"Split audio into {len(chunks)} chunk(s) "
-        f"({chunk_duration_seconds}s each)"
+        "Split %s into %d chunk(s) (%ds each)",
+        audio_path.name, len(chunks), chunk_duration_seconds,
     )
     return chunks

@@ -1,0 +1,46 @@
+{
+  "family": "meetolog-worker",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "meetolog-worker",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/meetolog:latest",
+      "essential": true,
+      "environment": [
+        { "name": "SERVICE_TYPE", "value": "worker" },
+        { "name": "WHISPER_MODEL", "value": "tiny" },
+        { "name": "LLM_PROVIDER", "value": "gemini" },
+        { "name": "TEST_MODE", "value": "false" },
+        { "name": "AWS_REGION", "value": "<REGION>" }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URL",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/DATABASE_URL"
+        },
+        {
+          "name": "AWS_S3_BUCKET",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/AWS_S3_BUCKET"
+        },
+        {
+          "name": "GEMINI_API_KEY",
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/GEMINI_API_KEY"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/meetolog-worker",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "worker"
+        }
+      },
+      "stopTimeout": 120
+    }
+  ]
+}

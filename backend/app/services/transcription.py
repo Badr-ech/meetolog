@@ -1,13 +1,16 @@
-"""
-Transcription service for converting audio to text.
-Uses OpenAI Whisper (local model) for Speech-to-Text.
+"""Transcription service for converting audio to text.
 
-Supports chunked transcription for memory safety on CPU-only machines:
+Uses OpenAI Whisper (local model) for Speech-to-Text with a
+memory-safe chunked pipeline:
+
 - Audio is split into fixed-duration chunks via ``ffmpeg``
   (see :mod:`app.utils.audio`)
-- Each chunk is transcribed sequentially (no parallelism)
+- The Whisper model is loaded **once** per process and cached
+- Each chunk is transcribed **sequentially** (no parallelism)
 - ``gc.collect()`` is called after every chunk to reclaim memory
-- All temporary chunk files are cleaned up in a ``try / finally`` block
+- Chunk files are deleted from disk immediately after transcription
+- A caller-supplied ``progress_callback`` enables granular progress
+  tracking in PostgreSQL
 
 Implements the :class:`Transcriber` interface for dependency injection.
 """
@@ -15,32 +18,25 @@ Implements the :class:`Transcriber` interface for dependency injection.
 import asyncio
 import gc
 import logging
+import os
 import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable
 
 from ..interfaces import Transcriber
-from ..utils.audio import get_audio_duration, split_audio_into_chunks
+from ..utils.audio import AudioSplitError, get_audio_duration, split_audio_into_chunks
 
 logger = logging.getLogger(__name__)
 
-# Re-export audio utilities so that existing ``from app.services.transcription
-# import split_audio_into_chunks`` statements keep working.
 __all__ = [
     "WhisperTranscriber",
-    "ChunkProgressCallback",
-    "compress_audio_for_storage",
-    "decompress_audio",
-    "get_audio_duration",
-    "split_audio_into_chunks",
+    "ProgressCallback",
     "_get_cached_model",
 ]
 
-# Type alias for the per-chunk progress callback.
-#   (chunk_index: int, total_chunks: int, chunk_text: str) -> Awaitable[None]
-ChunkProgressCallback = Callable[[int, int, str], Awaitable[None]]
+# 2-arg callback: (chunk_index, total_chunks)
+ProgressCallback = Callable[[int, int], Awaitable[None]]
 
 # Lazy import whisper to allow mock mode without whisper installed
 _whisper = None
@@ -74,80 +70,6 @@ def _get_cached_model(model_name: str):
     return _model_cache[model_name]
 
 
-def compress_audio_for_storage(audio_path: Path) -> bytes:
-    """
-    Compress audio to a small format for Redis storage.
-    
-    Converts to 16kHz mono Opus at 32kbps. A 42-minute meeting
-    compresses from ~42MB WAV to ~5-8MB.
-    
-    Args:
-        audio_path: Path to the source audio file
-        
-    Returns:
-        Compressed audio as bytes
-    """
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    
-    try:
-        cmd = [
-            "ffmpeg", "-y", "-i", str(audio_path),
-            "-ar", "16000", "-ac", "1",
-            "-c:a", "libopus", "-b:a", "32k",
-            str(tmp_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg compression failed: {result.stderr[:500]}")
-        
-        compressed = tmp_path.read_bytes()
-        logger.info(
-            f"Audio compressed: {audio_path.stat().st_size / 1024 / 1024:.1f}MB → "
-            f"{len(compressed) / 1024 / 1024:.1f}MB"
-        )
-        return compressed
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-def decompress_audio(audio_bytes: bytes, output_path: Path) -> Path:
-    """
-    Decompress stored audio bytes back to a WAV file for Whisper.
-    
-    Args:
-        audio_bytes: Compressed audio data (Opus/OGG)
-        output_path: Where to write the decompressed WAV
-        
-    Returns:
-        Path to the decompressed WAV file
-    """
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-    
-    try:
-        tmp_path.write_bytes(audio_bytes)
-        
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        cmd = [
-            "ffmpeg", "-y", "-i", str(tmp_path),
-            "-ar", "16000", "-ac", "1",
-            "-c:a", "pcm_s16le",
-            str(output_path),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        if result.returncode != 0:
-            raise RuntimeError(f"ffmpeg decompression failed: {result.stderr[:500]}")
-        
-        logger.info(f"Audio decompressed to: {output_path}")
-        return output_path
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
 class WhisperTranscriber(Transcriber):
     """
     Chunked Whisper transcriber with memory-safe processing.
@@ -164,7 +86,6 @@ class WhisperTranscriber(Transcriber):
     ):
         self._model_name = model_name
         self._chunk_duration_sec = chunk_duration_sec
-        self.on_chunk_complete: ChunkProgressCallback | None = None
         logger.info(
             f"WhisperTranscriber initialized "
             f"(model={model_name}, chunk_duration={chunk_duration_sec}s)"
@@ -193,34 +114,42 @@ class WhisperTranscriber(Transcriber):
     # Public API
     # ------------------------------------------------------------------
 
-    async def transcribe(self, audio_path: Path) -> str:
-        """
-        Transcribe an audio file using chunked processing.
+    async def transcribe(
+        self,
+        audio_path: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> str:
+        """Transcribe an audio file using chunked processing.
 
-        1. Splits the audio into ``chunk_duration_sec``-second chunks via
-           ``ffmpeg`` (all I/O goes to disk, not RAM).
-        2. Loads the Whisper model **once** (cached across invocations).
-        3. Transcribes each chunk **sequentially** – no parallelism.
-        4. Calls ``gc.collect()`` after every chunk for memory safety.
-        5. Merges chunk transcripts with a single-space separator.
+        Pipeline:
+            1. Split audio into ``chunk_duration_sec``-second WAV chunks
+               via ffmpeg (disk I/O only, nothing held in RAM).
+            2. Load the Whisper model **once** (cached across calls).
+            3. For each chunk:
+               a. Transcribe (offloaded to the thread pool).
+               b. Delete the chunk file from disk immediately.
+               c. ``del`` the result dict and call ``gc.collect()``.
+               d. Invoke *progress_callback* if provided.
+            4. Return the concatenated transcript.
 
-        If :attr:`on_chunk_complete` is set, it is awaited with
-        ``(chunk_index, total_chunks, chunk_text)`` after each chunk,
-        enabling the worker to report per-chunk progress to Redis.
+        Args:
+            audio_path: Path to the source audio file.
+            progress_callback: Optional async callable ``(chunk_index, total_chunks)``
+                invoked after each chunk completes.  Used by the worker to write
+                per-chunk progress to PostgreSQL.
 
-        All temporary chunk files are removed in a ``finally`` block even
-        if transcription fails mid-way.
+        Raises:
+            FileNotFoundError: If *audio_path* does not exist.
+            RuntimeError: If transcription fails.
         """
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
-        # Pre-load the model so any import errors surface early
         self._load_model()
 
         chunk_dir = Path(tempfile.mkdtemp(prefix="meetolog_chunks_"))
 
         try:
-            # --- Split audio into chunks on disk ---
             chunks = await asyncio.to_thread(
                 split_audio_into_chunks,
                 audio_path,
@@ -229,36 +158,36 @@ class WhisperTranscriber(Transcriber):
             )
             total_chunks = len(chunks)
 
-            if total_chunks == 0:
-                raise RuntimeError("Audio split produced zero chunks")
-
             logger.info(
-                f"Starting chunked transcription: {total_chunks} chunk(s), "
-                f"model={self._model_name}"
+                "Starting chunked transcription: %d chunk(s), model=%s",
+                total_chunks, self._model_name,
             )
 
             transcripts: list[str] = []
 
             for i, chunk_path in enumerate(chunks):
-                # Transcribe single chunk (blocking work in thread pool)
                 chunk_text = await asyncio.to_thread(
                     self._transcribe_sync, chunk_path,
                 )
-
-                # Basic whitespace normalisation
                 chunk_text = self._clean_text(chunk_text)
                 transcripts.append(chunk_text)
 
+                # Free disk space for this chunk immediately
+                try:
+                    os.remove(chunk_path)
+                except OSError:
+                    pass
+
                 logger.info(
-                    f"Chunk {i + 1}/{total_chunks} transcribed "
-                    f"({len(chunk_text)} chars)"
+                    "Chunk %d/%d transcribed (%d chars)",
+                    i + 1, total_chunks, len(chunk_text),
                 )
 
-                # Notify the caller (e.g. worker progress updates)
-                if self.on_chunk_complete is not None:
-                    await self.on_chunk_complete(i, total_chunks, chunk_text)
+                # Notify via the 2-arg callback
+                if progress_callback is not None:
+                    await progress_callback(i, total_chunks)
 
-                # Explicit memory reclamation after each chunk
+                # Reclaim memory aggressively
                 del chunk_text
                 gc.collect()
 
@@ -267,16 +196,22 @@ class WhisperTranscriber(Transcriber):
             if not full_transcript.strip():
                 raise RuntimeError("Transcription returned empty result")
 
+            logger.info(
+                "Chunked transcription complete: %d chunks, %d chars total",
+                total_chunks, len(full_transcript),
+            )
             return full_transcript
 
-        except Exception as e:
-            logger.error(f"Chunked transcription failed: {e}")
-            raise RuntimeError(f"Failed to transcribe audio: {e}") from e
+        except (AudioSplitError, RuntimeError):
+            raise
+
+        except Exception as exc:
+            logger.error("Chunked transcription failed: %s", exc)
+            raise RuntimeError(f"Failed to transcribe audio: {exc}") from exc
 
         finally:
-            # Always clean up chunk files, even on failure
             shutil.rmtree(chunk_dir, ignore_errors=True)
-            logger.debug(f"Cleaned up chunk directory: {chunk_dir}")
+            logger.debug("Cleaned up chunk directory: %s", chunk_dir)
 
     async def transcribe_chunk(self, chunk_path: Path) -> str:
         """Transcribe a single audio chunk (kept for backward compatibility)."""

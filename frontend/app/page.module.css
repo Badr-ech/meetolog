@@ -103,6 +103,17 @@
   margin-top: 1rem;
 }
 
+/* S3 direct-upload progress */
+.s3ProgressBar {
+  display: block;
+  width: 100%;
+  height: 6px;
+  border-radius: 3px;
+  appearance: none;
+  accent-color: #2563eb;
+  margin-top: 0.5rem;
+}
+
 /* Progress */
 .progressSection {
   margin-top: 1.5rem;

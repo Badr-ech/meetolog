@@ -1,502 +1,314 @@
 """
-ARQ Background Worker for Meetolog.
+PostgreSQL-backed background worker for Meetolog.
 
-Processes audio files through the transcription → extraction → PDF pipeline.
-Supports transcript/artifact caching for pipeline resumability and
-graceful recovery of interrupted jobs on restart.
+Polls the ``job_records`` table using ``SELECT … FOR UPDATE SKIP LOCKED``
+to claim pending jobs, then runs the transcription → extraction → PDF
+pipeline entirely within a temporary directory.  All outputs are uploaded
+to S3 — the worker holds zero persistent local state, enabling safe
+horizontal scaling across multiple replicas.
 """
 
 import asyncio
-import logging
 import os
-import shutil
+import signal
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from uuid import UUID
 
-from arq.connections import RedisSettings
+import structlog
 
 # Add parent directory to path for imports when running as worker
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.config import get_settings
-from app.models import ProcessingStatus
-from app.infrastructure.redis import get_arq_redis_settings, get_redis_pool, close_redis_pool
-from app.infrastructure.job_store import RedisJobStore
+from app.core.logger import configure_logging, get_logger
+from app.models import MeetingArtifacts, ProcessingStatus
+from app.infrastructure.db import get_session_factory, close_db, init_db
+from app.infrastructure.postgres_queue import PostgresJobQueue
+from app.services.storage import S3StorageService
 
-logger = logging.getLogger(__name__)
+# Initialise structured JSON logging before any log calls.
+configure_logging(json_output=True, log_level="INFO")
 
-# Configure logging for worker
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+logger = get_logger(component="worker")
+
+# Seconds to sleep when the queue is empty.
+POLL_INTERVAL_SECONDS = 5
 
 
-def get_transcriber():
+def _get_transcriber():
     settings = get_settings()
-    
+
     if settings.test_mode:
         from app.services.mock_services import MockTranscriber
         return MockTranscriber(simulated_delay=0.5)
-    
+
     try:
         from app.services.transcription import WhisperTranscriber
         return WhisperTranscriber(model_name=settings.whisper_model)
-    except Exception as e:
-        logger.error(f"Failed to initialize WhisperTranscriber: {e}")
+    except Exception as exc:
+        logger.error("Failed to initialize WhisperTranscriber: %s", exc)
         from app.services.mock_services import MockTranscriber
         return MockTranscriber(simulated_delay=0.5)
 
 
-def get_llm_provider():
+def _get_llm_provider():
     from app.services.llm_engine import get_llm_provider as _get_provider
     return _get_provider()
 
 
-def get_pdf_service():
+def _get_pdf_service(output_dir: Path):
+    """Return a PDFGeneratorService writing into the given temp directory."""
     from app.services.pdf_generator import PDFGeneratorService
-    settings = get_settings()
-    return PDFGeneratorService(Path(settings.output_dir))
+    return PDFGeneratorService(output_dir)
 
 
-async def process_audio_job(
-    ctx: dict,
-    job_id: str,
-    file_path: str,
+async def process_job(
+    job_id: UUID,
+    s3_key: str,
     file_name: str,
-    file_size: int,
-) -> dict:
+    queue: PostgresJobQueue,
+    s3_service: S3StorageService,
+    worker_id: str = "unknown",
+) -> None:
+    """Run the full transcription -> extraction -> PDF -> S3 pipeline.
+
+    All intermediate files live inside a ``TemporaryDirectory`` that is
+    destroyed automatically when the context exits — whether the pipeline
+    succeeds or crashes.  Final outputs (PDF, JSON) are persisted to S3
+    before the temp dir is removed, keeping the worker fully stateless.
+
+    The entire pipeline is wrapped in a catch-all exception handler so a
+    single bad job can never crash the worker loop.
     """
-    Main ARQ task for processing an audio file through the complete pipeline.
-    
-    Pipeline stages:
-    1. TRANSCRIBING (10-40%): Whisper STT
-    2. EXTRACTING (40-75%): LLM artifact extraction
-    3. GENERATING_PDF (75-95%): PDF report generation
-    4. COMPLETED (100%): Done
-    
-    Args:
-        ctx: ARQ context dict
-        job_id: UUID string of the job
-        file_path: Path to the uploaded audio file
-        file_name: Original filename
-        file_size: File size in bytes
-        
-    Returns:
-        Dict with job completion status
-    """
-    job_uuid = UUID(job_id)
-    worker_id = f"worker-{os.getpid()}"
-    
-    logger.info(f"[{job_id}] Starting processing pipeline for: {file_name}")
-    start_time = time.time()
-    
-    # Get job store from context
-    job_store: RedisJobStore = ctx["job_store"]
-    
-    # Update worker assignment
-    await job_store.update(job_uuid, worker_id=worker_id)
-    
-    audio_path = Path(file_path)
-    
+    # Bind structured context for every log emitted during this job.
+    job_logger = get_logger(
+        component="worker",
+        job_id=str(job_id),
+        worker_id=worker_id,
+        file_name=file_name,
+    )
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(job_id=str(job_id), worker_id=worker_id)
+
+    start_time = time.monotonic()
+    final_status = "failed"
+    job_logger.info("job_started", s3_key=s3_key)
+
     try:
-        # Stage 1: Transcription
-        logger.info(f"[{job_id}] Stage 1: Transcription starting")
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.TRANSCRIBING,
-            progress=25,
-        )
-        await job_store.update(
-            job_uuid,
-            message="Transcribing audio...",
-        )
-        
-        # Check for cached full transcript (resumability from prior run)
-        transcript = await job_store.get_cached_transcript(job_uuid)
-        
-        if transcript:
-            logger.info(f"[{job_id}] Using cached transcript (resuming)")
-        else:
-            # -----------------------------------------------------------------
-            # Resolve audio source: local file or Redis-stored compressed audio
-            # -----------------------------------------------------------------
-            work_dir = Path(tempfile.mkdtemp(prefix=f"meetolog_{job_id}_"))
-            
-            try:
-                if audio_path.exists():
-                    # Fresh job — audio file is on disk
-                    effective_audio = audio_path
-                    
-                    # Compress & store in Redis for restart resilience
-                    try:
-                        from app.services.transcription import compress_audio_for_storage
-                        
-                        logger.info(f"[{job_id}] Compressing audio for Redis backup...")
-                        compressed = await asyncio.to_thread(
-                            compress_audio_for_storage, audio_path
-                        )
-                        stored = await job_store.store_audio(job_uuid, compressed)
-                        if stored:
-                            logger.info(f"[{job_id}] Audio backed up to Redis")
-                        else:
-                            logger.warning(f"[{job_id}] Audio too large for Redis backup")
-                    except Exception as e:
-                        logger.warning(f"[{job_id}] Failed to backup audio to Redis: {e}")
-                else:
-                    # Resumed job — try to restore from Redis
-                    stored_audio = await job_store.get_stored_audio(job_uuid)
-                    if stored_audio is None:
-                        raise FileNotFoundError(
-                            f"Audio file not found on disk or in Redis: {audio_path}"
-                        )
-                    
-                    logger.info(f"[{job_id}] Restoring audio from Redis backup...")
-                    from app.services.transcription import decompress_audio
-                    
-                    restored_path = work_dir / "restored_audio.wav"
-                    await asyncio.to_thread(
-                        decompress_audio, stored_audio, restored_path
-                    )
-                    effective_audio = restored_path
-                    logger.info(f"[{job_id}] Audio restored from Redis")
-                
-                # ---------------------------------------------------------
-                # Transcribe (chunking + gc handled inside the transcriber)
-                # ---------------------------------------------------------
-                transcriber = get_transcriber()
+        with tempfile.TemporaryDirectory(prefix=f"meetolog_{job_id}_") as work_dir:
+            work_path = Path(work_dir)
+            file_ext = Path(file_name).suffix.lower() or ".wav"
+            audio_path = work_path / f"{job_id}{file_ext}"
 
-                # Attach per-chunk progress callback (WhisperTranscriber
-                # exposes ``on_chunk_complete``; MockTranscriber does not).
-                if hasattr(transcriber, "on_chunk_complete"):
-                    async def _on_chunk(
-                        chunk_idx: int, total: int, text: str,
-                    ) -> None:
-                        pct = 25 + int(23 * ((chunk_idx + 1) / total))
-                        await job_store.update(
-                            job_uuid,
-                            progress=pct,
-                            message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
-                        )
+            # --- Download audio from S3 ---
+            job_logger.info("s3_download_start", s3_key=s3_key)
+            await s3_service.download_to_file(s3_key, str(audio_path))
 
-                    transcriber.on_chunk_complete = _on_chunk
+            # --- Stage 1: Transcription ---
+            await queue.update_job_progress(
+                job_id,
+                status=ProcessingStatus.TRANSCRIBING.value,
+                progress=25,
+                message="Transcribing audio...",
+            )
 
-                transcript = await transcriber.transcribe(effective_audio)
+            transcriber = _get_transcriber()
 
-                # Cache the full transcript for restart resilience
-                await job_store.cache_transcript(job_uuid, transcript)
-                await job_store.delete_chunk_data(job_uuid)
-                logger.info(f"[{job_id}] Full transcript cached")
-                
-            finally:
-                # Clean up temp directory
-                shutil.rmtree(work_dir, ignore_errors=True)
-        
-        await job_store.update(
-            job_uuid,
-            progress=48,
-            message="Transcription complete",
-        )
-        
-        transcription_time = time.time() - start_time
-        logger.info(f"[{job_id}] Transcription completed in {transcription_time:.2f}s")
-        
-        # Stage 2: LLM Extraction
-        logger.info(f"[{job_id}] Stage 2: LLM Extraction starting")
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.EXTRACTING,
-            progress=50,
-        )
-        await job_store.update(
-            job_uuid,
-            message="Extracting Agile artifacts...",
-        )
-        
-        # Check for cached artifacts (resumability)
-        artifacts = await job_store.get_cached_artifacts(job_uuid)
-        
-        if artifacts:
-            logger.info(f"[{job_id}] Using cached artifacts (resuming)")
-        else:
-            # Run LLM extraction
-            llm_provider = get_llm_provider()
-            artifacts = await llm_provider.extract_artifacts(transcript)
-            
-            # Backfill confidence scores via heuristic for any artifacts
-            # where the LLM (or mock) did not provide a score.
+            async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
+                pct = 25 + int(23 * ((chunk_idx + 1) / total))
+                job_logger.info(
+                    "transcription_progress",
+                    chunk=chunk_idx + 1,
+                    total_chunks=total,
+                    progress_pct=pct,
+                )
+                await queue.update_job_progress(
+                    job_id,
+                    progress=pct,
+                    message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
+                )
+
+            transcript = await transcriber.transcribe(
+                audio_path,
+                progress_callback=_on_transcription_progress,
+            )
+
+            await queue.update_job_progress(
+                job_id, progress=48, message="Transcription complete",
+            )
+            transcription_time = time.monotonic() - start_time
+            job_logger.info("transcription_complete", duration_seconds=round(transcription_time, 2))
+
+            # --- Stage 2: LLM Extraction ---
+            await queue.update_job_progress(
+                job_id,
+                status=ProcessingStatus.EXTRACTING.value,
+                progress=50,
+                message="Extracting Agile artifacts...",
+            )
+
+            llm_provider = _get_llm_provider()
+            artifacts: MeetingArtifacts = await llm_provider.extract_artifacts(transcript)
+
             from app.services.heuristics import backfill_confidence_scores
             backfill_confidence_scores(artifacts)
-            
-            # Cache artifacts for resumability
-            await job_store.cache_artifacts(job_uuid, artifacts)
-            logger.info(f"[{job_id}] Artifacts cached for resumability")
-        
-        await job_store.update(
-            job_uuid,
-            progress=72,
-            message="Artifact extraction complete",
-        )
-        
-        extraction_time = time.time() - start_time - transcription_time
-        logger.info(f"[{job_id}] Extraction completed in {extraction_time:.2f}s")
-        
-        # Stage 3: PDF Generation
-        logger.info(f"[{job_id}] Stage 3: PDF Generation starting")
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.GENERATING_PDF,
-            progress=75,
-        )
-        await job_store.update(
-            job_uuid,
-            message="Generating PDF summary...",
-        )
-        
-        # Re-fetch the latest artifacts from Redis so that any user edits
-        # made between extraction and PDF generation are reflected.
-        latest_artifacts = await job_store.get_cached_artifacts(job_uuid)
-        if latest_artifacts is not None:
-            artifacts = latest_artifacts
-            logger.info(f"[{job_id}] Using latest artifacts from Redis for PDF")
-        
-        pdf_service = get_pdf_service()
-        pdf_filename = f"meeting_{job_id}.pdf"
-        pdf_path = await pdf_service.generate(artifacts, pdf_filename)
-        
-        await job_store.update(
-            job_uuid,
-            progress=95,
-            message="PDF generated, finalising...",
-        )
-        
-        pdf_time = time.time() - start_time - transcription_time - extraction_time
-        logger.info(f"[{job_id}] PDF generated in {pdf_time:.2f}s: {pdf_path}")
-        
-        # Stage 4: Completion
-        total_time = time.time() - start_time
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.COMPLETED,
-            progress=100,
-        )
-        await job_store.update(
-            job_uuid,
-            message="Processing complete!",
-            pdf_url=f"/download/{job_id}",
-            artifacts=artifacts,
-        )
-        
-        logger.info(
-            f"[{job_id}] Pipeline completed successfully in {total_time:.2f}s "
-            f"(transcribe: {transcription_time:.2f}s, extract: {extraction_time:.2f}s, pdf: {pdf_time:.2f}s)"
-        )
-        
-        # Cleanup uploaded audio file
-        if audio_path.exists():
-            audio_path.unlink()
-            logger.debug(f"[{job_id}] Cleaned up audio file: {audio_path}")
-        
-        return {
-            "status": "completed",
-            "job_id": job_id,
-            "total_time_seconds": total_time,
-        }
-        
-    except FileNotFoundError as e:
-        logger.error(f"[{job_id}] File not found: {e}")
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.FAILED,
-            progress=0,
-        )
-        await job_store.update(
-            job_uuid,
-            error=f"Audio file not found: {e}",
-            message="Processing failed: File not found",
-        )
-        return {"status": "failed", "job_id": job_id, "error": str(e)}
-        
-    except Exception as e:
-        logger.exception(f"[{job_id}] Pipeline failed with error: {e}")
-        await job_store.update_job_stage(
-            job_uuid,
-            status=ProcessingStatus.FAILED,
-            progress=0,
-        )
-        await job_store.update(
-            job_uuid,
-            error=str(e),
-            message=f"Processing failed: {e}",
-        )
-        return {"status": "failed", "job_id": job_id, "error": str(e)}
 
-
-async def startup(ctx: dict) -> None:
-    """
-    Worker startup hook — initialise shared resources and recover stale jobs.
-    """
-    logger.info("ARQ Worker starting up...")
-    
-    # Initialize Redis connection
-    redis = await get_redis_pool()
-    ctx["redis"] = redis
-    
-    # Initialize job store
-    job_store = RedisJobStore(redis)
-    ctx["job_store"] = job_store
-    
-    # Recover zombie jobs (jobs interrupted by restart)
-    try:
-        from arq import create_pool
-        
-        stale_jobs = await job_store.find_stale_jobs()
-        
-        if not stale_jobs:
-            logger.info("No stale jobs found")
-        else:
-            logger.warning(f"Found {len(stale_jobs)} stale job(s), attempting recovery...")
-            
-            # Get ARQ pool for re-queuing
-            arq_pool = await create_pool(get_arq_redis_settings())
-            
-            resumed = 0
-            failed = 0
-            
-            for job_id, metadata in stale_jobs:
-                # A job is resumable if it has:
-                # 1. A full cached transcript or artifacts (existing logic), OR
-                # 2. Audio stored in Redis (can re-transcribe from chunks)
-                has_progress = (
-                    metadata["has_transcript"] == "1" or 
-                    metadata["has_artifacts"] == "1"
-                )
-                has_audio = metadata.get("has_audio") == "1"
-                
-                can_resume = has_progress or has_audio
-                
-                if can_resume:
-                    # Re-queue the job to resume processing
-                    try:
-                        await arq_pool.enqueue_job(
-                            "process_audio_job",
-                            job_id,
-                            metadata["file_path"],
-                            metadata["file_name"],
-                            metadata["file_size"],
-                        )
-                        resumed += 1
-                        resume_reason = []
-                        if has_progress:
-                            resume_reason.append("cached progress")
-                        if has_audio:
-                            resume_reason.append("stored audio")
-                        logger.info(
-                            f"Re-queued job {job_id} for resumption "
-                            f"({', '.join(resume_reason)})"
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to re-queue job {job_id}: {e}")
-                        await job_store.mark_job_failed(
-                            UUID(job_id),
-                            f"Failed to resume after restart: {e}"
-                        )
-                        failed += 1
-                else:
-                    # No cached progress and no stored audio — unrecoverable
-                    await job_store.mark_job_failed(
-                        UUID(job_id),
-                        "Job interrupted by server restart. Please re-upload your file."
-                    )
-                    failed += 1
-                    logger.warning(f"Marked job {job_id} as failed (no cached progress or audio)")
-            
-            await arq_pool.close()
-            
-            logger.info(
-                f"Recovery complete: {resumed} resumed, {failed} failed"
+            await queue.update_job_progress(
+                job_id, progress=72, message="Artifact extraction complete",
             )
-    except Exception as e:
-        logger.error(f"Failed to recover zombie jobs: {e}")
-    
-    # Pre-warm the Whisper model into memory so the first job
-    # doesn't waste time loading it (saves ~2-3s per cold start)
+            extraction_time = time.monotonic() - start_time - transcription_time
+            job_logger.info("extraction_complete", duration_seconds=round(extraction_time, 2))
+
+            # --- Stage 3: PDF Generation (into temp dir) ---
+            await queue.update_job_progress(
+                job_id,
+                status=ProcessingStatus.GENERATING_PDF.value,
+                progress=75,
+                message="Generating PDF summary...",
+            )
+
+            pdf_service = _get_pdf_service(work_path)
+            pdf_filename = f"meeting_{job_id}.pdf"
+            await pdf_service.generate(artifacts, pdf_filename)
+            pdf_local_path = work_path / pdf_filename
+
+            pdf_time = time.monotonic() - start_time - transcription_time - extraction_time
+            job_logger.info("pdf_generated", duration_seconds=round(pdf_time, 2))
+
+            # --- Stage 4: Upload results to S3 ---
+            await queue.update_job_progress(
+                job_id, progress=90, message="Uploading results to S3...",
+            )
+
+            job_id_str = str(job_id)
+            artifacts_dict = artifacts.model_dump(mode="json")
+            pdf_s3_key = await s3_service.upload_pdf(str(pdf_local_path), job_id_str)
+            artifacts_s3_key = await s3_service.upload_artifacts_json(artifacts_dict, job_id_str)
+
+            job_logger.info("s3_upload_complete", pdf_s3_key=pdf_s3_key, artifacts_s3_key=artifacts_s3_key)
+
+            # --- Stage 5: Mark complete ---
+            await queue.mark_job_completed(
+                job_id,
+                artifacts=artifacts_dict,
+                pdf_url=f"/download/{job_id}",
+                pdf_s3_key=pdf_s3_key,
+                artifacts_s3_key=artifacts_s3_key,
+            )
+            final_status = "completed"
+
+    except FileNotFoundError as exc:
+        job_logger.error("job_error", error=f"Audio file not found: {exc}")
+        try:
+            await queue.mark_job_failed(job_id, f"Audio file not found: {exc}")
+        except Exception:
+            job_logger.exception("mark_failed_error")
+
+    except Exception:
+        job_logger.exception("job_error")
+        try:
+            await queue.mark_job_failed(job_id, traceback.format_exc()[-1000:])
+        except Exception:
+            job_logger.exception("mark_failed_error")
+
+    finally:
+        duration = round(time.monotonic() - start_time, 2)
+        job_logger.info(
+            "job_finished",
+            status=final_status,
+            duration_seconds=duration,
+        )
+        structlog.contextvars.clear_contextvars()
+
+
+# ------------------------------------------------------------------
+# Async worker loop
+# ------------------------------------------------------------------
+
+_shutdown_event = asyncio.Event()
+
+
+def _request_shutdown() -> None:
+    """Signal handler — request a graceful loop exit."""
+    logger.info("shutdown_requested")
+    _shutdown_event.set()
+
+
+async def worker_loop(worker_id: str | None = None) -> None:
+    """Continuously poll the Postgres job queue and process jobs.
+
+    The loop exits cleanly on SIGINT / SIGTERM.  If no job is available
+    it sleeps for ``POLL_INTERVAL_SECONDS`` to avoid wasteful queries.
+    """
+    if worker_id is None:
+        worker_id = f"worker-{os.getpid()}"
+
     settings = get_settings()
+
+    # Register OS signal handlers for graceful shutdown
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown)
+        except NotImplementedError:
+            # Windows does not support add_signal_handler
+            signal.signal(sig, lambda *_: _request_shutdown())
+
+    await init_db()
+    session_factory = get_session_factory()
+    s3_service = S3StorageService()
+
+    # Pre-warm Whisper model
     if not settings.test_mode:
         try:
-            logger.info(f"Pre-warming Whisper model: {settings.whisper_model}")
+            logger.info("whisper_prewarm_start", model=settings.whisper_model)
             from app.services.transcription import _get_cached_model
-            import asyncio
             await asyncio.to_thread(_get_cached_model, settings.whisper_model)
-            logger.info("Whisper model ready")
-        except Exception as e:
-            logger.warning(f"Failed to pre-warm Whisper model (will load on first job): {e}")
-    
-    logger.info("Worker startup complete")
+            logger.info("whisper_prewarm_done")
+        except Exception as exc:
+            logger.warning("whisper_prewarm_failed", error=str(exc))
 
+    logger.info("worker_started", worker_id=worker_id, poll_interval=POLL_INTERVAL_SECONDS)
 
-async def shutdown(ctx: dict) -> None:
-    """Worker shutdown hook — release the Redis connection pool."""
-    logger.info("ARQ Worker shutting down...")
-    
-    await close_redis_pool()
-    
-    logger.info("Worker shutdown complete")
+    try:
+        while not _shutdown_event.is_set():
+            async with session_factory() as session:
+                queue = PostgresJobQueue(session)
+                record = await queue.claim_next_job(worker_id)
 
+            if record is None:
+                try:
+                    await asyncio.wait_for(
+                        _shutdown_event.wait(),
+                        timeout=POLL_INTERVAL_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
 
-async def on_job_start(ctx: dict) -> None:
-    """Hook called when a job starts. ARQ passes only ctx."""
-    logger.debug("Job starting")
+            logger.info("job_claimed", job_id=str(record.id), worker_id=worker_id)
 
-
-async def on_job_end(ctx: dict) -> None:
-    """Hook called when a job ends. ARQ passes only ctx."""
-    logger.debug("Job ended")
-
-
-class WorkerSettings:
-    """ARQ Worker configuration."""
-    
-    # Redis connection
-    redis_settings = get_arq_redis_settings()
-    
-    # Task functions that this worker can execute
-    functions = [process_audio_job]
-    
-    # Lifecycle hooks
-    on_startup = startup
-    on_shutdown = shutdown
-    on_job_start = on_job_start
-    on_job_end = on_job_end
-    
-    # Job configuration
-    max_jobs = 5  # Max concurrent jobs per worker
-    job_timeout = 1800  # 30 minutes max per job
-    max_tries = 3  # Retry failed jobs up to 3 times
-    retry_delay = 60  # Wait 60 seconds before retry
-    
-    # Health check
-    health_check_interval = 60
-    
-    # Queue name (use ARQ default)
-    # queue_name = "arq:queue"  # Default, no need to specify
-    
-    # Logging
-    log_results = True
+            # Each job gets its own session so a failure cannot poison
+            # the poll loop's connection state.
+            async with session_factory() as job_session:
+                job_queue = PostgresJobQueue(job_session)
+                await process_job(
+                    job_id=record.id,
+                    s3_key=record.s3_key,
+                    file_name=record.file_name,
+                    queue=job_queue,
+                    s3_service=s3_service,
+                    worker_id=worker_id,
+                )
+    finally:
+        await close_db()
+        logger.info("worker_stopped", worker_id=worker_id)
 
 
 if __name__ == "__main__":
-    import arq
-    
-    print("Starting Meetolog ARQ Worker...")
-    print(f"Redis URL: {get_settings().redis_url}")
-    print(f"Test Mode: {get_settings().test_mode}")
-    print(f"LLM Provider: {get_settings().llm_provider}")
-    
-    # Run the worker
-    arq.run_worker(WorkerSettings)
+    asyncio.run(worker_loop())

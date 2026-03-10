@@ -1,61 +1,79 @@
-# Ignore environment files
+# =============================================================================
+# Meetolog .gitignore — Python/Next.js AWS project
+# =============================================================================
+
+# ── Environment files ────────────────────────────────────────────────────────
 .env
 .env.*
-.env.local
-.env.*.local
+!.env.example
+!.env.docker
 
-# Markdown files (ignore AI-generated planning docs)
-*.md
-!README.md
-!CAPSTONE_REPORT.md
-
-# Ignore outputs and uploads (generated files)
-outputs/
-backend/outputs/
-uploads/
-backend/uploads/
-
-# Python
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+*.egg-info/
+*.egg
 
-# Virtual environments
+# ── Virtual environments ─────────────────────────────────────────────────────
 venv/
 .venv/
 ENV/
 env/
 backend/venv/
 
-# Editor/IDE
-.vscode/
-.idea/
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logs and coverage
-*.log
-.coverage
-htmlcov/
-
-# Database files
-*.sqlite3
-*.db
-
-# Frontend
+# ── Node / Next.js ───────────────────────────────────────────────────────────
 node_modules/
 .next/
 dist/
 build/
+out/
 
-# Misc
+# ── Generated outputs ────────────────────────────────────────────────────────
+outputs/
+backend/outputs/
+uploads/
+backend/uploads/
+
+# ── Logs & coverage ──────────────────────────────────────────────────────────
+*.log
+.coverage
+htmlcov/
+coverage/
+
+# ── Database files ───────────────────────────────────────────────────────────
+*.sqlite3
+*.db
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Secrets & keys ───────────────────────────────────────────────────────────
 *.pem
 *.key
-*.env
 
-# Keep .github (CI/workflows) in repo
+# ── Academic / internal documents ────────────────────────────────────────────
+CAPSTONE_REPORT.md
+AWS_DEPLOYMENT.md
+
+# ── Jupyter / scratch ────────────────────────────────────────────────────────
+*.ipynb
+.ipynb_checkpoints/
+
+# ── Dataset / temp artifacts ─────────────────────────────────────────────────
+dataset_audio/
+*.tmp
+*.bak
+
+# ── Keep .github (CI/workflows) in repo ──────────────────────────────────────
 !/.github/

@@ -260,7 +260,7 @@ export default function VoiceRecorder({ onFileReady, disabled }: VoiceRecorderPr
               ) : (
                 <>
                   <span>Drop audio file here or click to browse</span>
-                  <span className={styles.hint}>MP3, WAV, M4A, OGG, WebM (max 100MB)</span>
+                  <span className={styles.hint}>MP3, WAV, M4A, OGG, WebM (max 1 GB)</span>
                 </>
               )}
             </label>
