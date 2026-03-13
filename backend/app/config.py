@@ -42,6 +42,12 @@ class Settings(BaseSettings):
         default="tiny",
         description="Whisper model size. 'tiny' for free tier, 'base' for better accuracy."
     )
+
+    hf_token: str = Field(
+        default="",
+        description="HuggingFace access token for pyannote speaker diarization. "
+                    "Leave empty to disable diarization."
+    )
     
     app_name: str = Field(default="Meetolog")
     debug: bool = Field(default=False)
@@ -61,7 +67,81 @@ class Settings(BaseSettings):
         default="http://localhost:3000,http://127.0.0.1:3000",
         description="Comma-separated list of allowed CORS origins"
     )
-    
+
+    # Hierarchical summarization
+    hierarchical_token_threshold: int = Field(
+        default=12000,
+        ge=1000,
+        description="Transcripts exceeding this token count trigger hierarchical summarization",
+    )
+    hierarchical_chunk_max_tokens: int = Field(
+        default=6000,
+        ge=500,
+        description="Maximum tokens per chunk in the Map phase",
+    )
+    hierarchical_chunk_overlap_tokens: int = Field(
+        default=200,
+        ge=0,
+        description="Overlap tokens between consecutive chunks",
+    )
+    hierarchical_max_summary_tokens: int = Field(
+        default=12000,
+        ge=1000,
+        description="If merged summaries exceed this, an additional Reduce pass is applied",
+    )
+    hierarchical_concurrency_limit: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        description="Maximum concurrent LLM calls during the Map phase",
+    )
+
+    # Context Compression
+    compression_enabled: bool = Field(
+        default=True,
+        description="Enable context compression before final LLM extraction to reduce token usage",
+    )
+    compression_target_budget_tokens: int = Field(
+        default=8000,
+        ge=500,
+        description="Target token budget for compressed context sent to the extraction prompt",
+    )
+
+    # RAG Transcript Retrieval
+    rag_chunk_max_tokens: int = Field(
+        default=1500,
+        ge=100,
+        description="Maximum tokens per chunk for RAG indexing (smaller than hierarchical chunks for retrieval precision)",
+    )
+    rag_chunk_overlap_tokens: int = Field(
+        default=100,
+        ge=0,
+        description="Overlap tokens between consecutive RAG chunks",
+    )
+    rag_top_k: int = Field(
+        default=5,
+        ge=1,
+        le=50,
+        description="Number of top-K chunks to retrieve per artifact category",
+    )
+    rag_max_context_tokens: int = Field(
+        default=3000,
+        ge=500,
+        description="Maximum token budget for the RAG context injected into the extraction prompt",
+    )
+    rag_embedding_batch_size: int = Field(
+        default=64,
+        ge=1,
+        le=2048,
+        description="Batch size for embedding API calls during RAG indexing",
+    )
+    rag_storage_backend: Literal["memory", "pgvector"] = Field(
+        default="memory",
+        description="Storage backend for the RAG vector index. "
+                    "'memory' uses ephemeral NumPy arrays (destroyed when the worker finishes); "
+                    "'pgvector' persists embeddings in PostgreSQL via the pgvector extension.",
+    )
+
     # AWS S3 configuration
     aws_access_key_id: str = Field(
         default="",

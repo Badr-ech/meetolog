@@ -15,19 +15,32 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Literal
 
-from ..config import get_settings, Settings
-from ..models import (
-    MeetingArtifacts,
-    UserStory,
-    Task,
-    Decision,
-    Blocker,
-    ActionItem,
-    Priority,
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
 )
-from ..models.schemas import ActionableTask
+
+from pydantic import ValidationError
+
+from ..config import get_settings, Settings
+from ..core.prompts import build_extraction_prompt
+from ..models import MeetingArtifacts
+from ..models.artifacts import (
+    LLMExtractionResponse,
+    strip_markdown_fencing,
+    to_meeting_artifacts,
+    validate_llm_response,
+)
 
 logger = logging.getLogger(__name__)
+
+# Timeout for a single LLM API call (seconds).
+_LLM_CALL_TIMEOUT = 60
+
+# Transient errors worth retrying.
+_LLM_RETRYABLE = (ConnectionError, TimeoutError, asyncio.TimeoutError)
 
 
 class LLMProvider(ABC):
@@ -56,204 +69,31 @@ class LLMProvider(ABC):
             RuntimeError: If extraction fails
         """
         ...
-    
+
+    async def generate_text(self, prompt: str) -> str:
+        """Send a free-form prompt and return the raw text response.
+
+        Used by the hierarchical summarization pipeline for chunk
+        summarisation and merge steps.  Subclasses that cannot perform
+        raw generation (e.g. mocks) should return an empty string or
+        raise ``NotImplementedError``.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support generate_text"
+        )
+
     def _build_extraction_prompt(self, transcript: str) -> str:
-        return f"""You are an expert Agile Project Manager assistant analyzing a meeting transcript.
-Your task is to extract all relevant Agile artifacts from the transcript and return them as strictly valid JSON.
-
-TRANSCRIPT:
----
-{transcript}
----
-
-INSTRUCTIONS:
-1. Identify all USER STORIES mentioned (look for "As a...", feature requests, user needs, or requirements)
-2. Identify all TASKS (specific work items, assignments, to-dos, action items assigned to people)
-3. Identify all DECISIONS made (agreements, choices, determinations, conclusions reached)
-4. Identify all BLOCKERS (impediments, dependencies, things preventing progress, issues raised)
-5. Identify all ACTION ITEMS (follow-ups that don't fit other categories)
-6. Extract participant names mentioned in the transcript
-7. Estimate story points for user stories using Fibonacci sequence (1, 2, 3, 5, 8, 13)
-8. Assign priorities based on context and urgency (low, medium, high, critical)
-9. Generate a concise 2-3 sentence summary of the meeting
-10. Identify EXECUTION TASKS — both explicit tasks directly stated and inferred tasks logically implied by the discussion. Tag each as "Explicit" or "Inferred" with a confidence score.
-
-CRITICAL: Return ONLY valid JSON with no additional text, markdown formatting, or explanation.
-The response must be parseable by json.loads() directly.
-
-Required JSON structure:
-{{
-    "meeting_title": "string - infer an appropriate title from the meeting content",
-    "summary": "string - 2-3 sentence summary of the meeting",
-    "participants": ["list of participant names mentioned"],
-    "user_stories": [
-        {{
-            "title": "string - brief descriptive title",
-            "as_a": "user role",
-            "i_want": "desired action or feature",
-            "so_that": "benefit or value",
-            "acceptance_criteria": ["list of acceptance criteria if mentioned"],
-            "priority": "low|medium|high|critical",
-            "story_points": null or number (1, 2, 3, 5, 8, 13)
-        }}
-    ],
-    "tasks": [
-        {{
-            "title": "string - brief task description",
-            "description": "string - detailed description",
-            "assignee": "name or null if not assigned",
-            "priority": "low|medium|high|critical",
-            "due_date": "string or null if not mentioned"
-        }}
-    ],
-    "decisions": [
-        {{
-            "title": "string - decision summary",
-            "description": "string - full decision details",
-            "made_by": "name or null",
-            "rationale": "string - reason for the decision"
-        }}
-    ],
-    "blockers": [
-        {{
-            "title": "string - blocker summary",
-            "description": "string - details about the blocker",
-            "affected_tasks": ["list of affected task titles"],
-            "owner": "name responsible for resolving or null",
-            "resolution_plan": "string - proposed solution if discussed"
-        }}
-    ],
-    "action_items": [
-        {{
-            "description": "string - what needs to be done",
-            "assignee": "name or null",
-            "due_date": "string or null"
-        }}
-    ],
-    "execution_tasks": [
-        {{
-            "title": "string - concise task title",
-            "description": "string - detailed description of work required",
-            "owner_role": "string - responsible role (e.g., Engineering, Design, Product) or specific name",
-            "priority": "High|Medium|Low",
-            "task_source": "Explicit|Inferred",
-            "dependencies": ["list of other tasks or conditions this depends on"],
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ]
-}}
-
-If no items exist for a category, return an empty array [].
-Now analyze the transcript and return the JSON:"""
+        """Build the artifact extraction prompt using the template system."""
+        return build_extraction_prompt(transcript)
 
     def _parse_extraction(self, data: dict, transcript: str) -> MeetingArtifacts:
-        """Parse LLM JSON response into Pydantic models."""
-        
-        def parse_priority(p: str | None) -> Priority:
-            if not p:
-                return Priority.MEDIUM
-            mapping = {
-                "low": Priority.LOW,
-                "medium": Priority.MEDIUM,
-                "high": Priority.HIGH,
-                "critical": Priority.CRITICAL
-            }
-            return mapping.get(p.lower(), Priority.MEDIUM)
-        
-        user_stories = [
-            UserStory(
-                title=s.get("title", ""),
-                as_a=s.get("as_a", ""),
-                i_want=s.get("i_want", ""),
-                so_that=s.get("so_that", ""),
-                acceptance_criteria=s.get("acceptance_criteria", []),
-                priority=parse_priority(s.get("priority")),
-                story_points=s.get("story_points"),
-            )
-            for s in data.get("user_stories", [])
-        ]
-        
-        tasks = [
-            Task(
-                title=t.get("title", ""),
-                description=t.get("description", ""),
-                assignee=t.get("assignee"),
-                priority=parse_priority(t.get("priority")),
-                due_date=t.get("due_date"),
-            )
-            for t in data.get("tasks", [])
-        ]
-        
-        decisions = [
-            Decision(
-                title=d.get("title", ""),
-                description=d.get("description", ""),
-                made_by=d.get("made_by"),
-                rationale=d.get("rationale", ""),
-            )
-            for d in data.get("decisions", [])
-        ]
-        
-        blockers = [
-            Blocker(
-                title=b.get("title", ""),
-                description=b.get("description", ""),
-                affected_tasks=b.get("affected_tasks", []),
-                owner=b.get("owner"),
-                resolution_plan=b.get("resolution_plan", ""),
-            )
-            for b in data.get("blockers", [])
-        ]
-        
-        action_items = [
-            ActionItem(
-                description=a.get("description", ""),
-                assignee=a.get("assignee"),
-                due_date=a.get("due_date"),
-            )
-            for a in data.get("action_items", [])
-        ]
-        
-        execution_tasks = [
-            ActionableTask(
-                title=et.get("title", ""),
-                description=et.get("description", ""),
-                owner_role=et.get("owner_role", "Engineering"),
-                priority=et.get("priority", "Medium"),
-                task_source=et.get("task_source", "Inferred"),
-                dependencies=et.get("dependencies", []),
-                confidence_score=et.get("confidence_score"),
-            )
-            for et in data.get("execution_tasks", [])
-        ]
-        
-        return MeetingArtifacts(
-            meeting_title=data.get("meeting_title", "Meeting"),
-            meeting_date=datetime.now(),
-            participants=data.get("participants", []),
-            summary=data.get("summary", ""),
-            user_stories=user_stories,
-            tasks=tasks,
-            decisions=decisions,
-            blockers=blockers,
-            action_items=action_items,
-            execution_tasks=execution_tasks,
-            transcript=transcript,
-        )
+        """Parse LLM JSON response into Pydantic models via the validation layer."""
+        validated = LLMExtractionResponse.model_validate(data)
+        return to_meeting_artifacts(validated, transcript)
     
     def _clean_json_response(self, text: str) -> str:
         """Remove markdown code blocks from LLM response."""
-        text = text.strip()
-        
-        # Remove markdown code blocks if present
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove first line (```json) and last line (```)
-            if len(lines) > 2:
-                text = "\n".join(lines[1:-1])
-            text = text.strip()
-        
-        return text
+        return strip_markdown_fencing(text)
 
 
 class GeminiProvider(LLMProvider):
@@ -316,45 +156,77 @@ class GeminiProvider(LLMProvider):
             logger.info("Gemini model initialized successfully")
         return self._model
     
-    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
-        """Extract artifacts using Gemini API."""
+    @retry(
+        retry=retry_if_exception_type(_LLM_RETRYABLE),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _call_gemini(
+        self,
+        prompt: str,
+        *,
+        temperature: float = 0.1,
+        max_output_tokens: int = 4096,
+    ) -> str:
+        """Call Gemini with retry and timeout; return raw response text."""
         model = self._get_model()
-        prompt = self._build_extraction_prompt(transcript)
-        
-        try:
-            logger.info("Calling Gemini API for artifact extraction")
-            
-            genai = self._get_genai()
-            
-            # Call Gemini API in thread pool to not block async
+        genai = self._get_genai()
+        async with asyncio.timeout(_LLM_CALL_TIMEOUT):
             response = await asyncio.to_thread(
                 model.generate_content,
                 prompt,
                 generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=4096,
-                )
+                    temperature=temperature,
+                    max_output_tokens=max_output_tokens,
+                ),
             )
-            
-            if not response or not response.text:
-                raise RuntimeError("Gemini API returned empty response")
-            
-            # Parse the JSON response
-            json_text = self._clean_json_response(response.text)
-            
+        if not response or not response.text:
+            raise RuntimeError("Gemini API returned empty response")
+        return response.text
+
+    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
+        """Extract artifacts using Gemini with validation and retry.
+
+        Attempts extraction at temperature 0.1. If the LLM response
+        fails JSON parsing or Pydantic validation, retries once at
+        temperature 0.0 for maximum determinism.
+        """
+        prompt = build_extraction_prompt(transcript)
+        temperatures = [0.1, 0.0]
+        last_error: Exception | None = None
+
+        for attempt, temp in enumerate(temperatures, 1):
             try:
-                extracted = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Gemini response as JSON: {e}")
-                logger.error(f"Raw response: {json_text[:500]}...")
-                raise RuntimeError(f"Failed to parse LLM response as JSON: {e}") from e
-            
-            logger.info("Successfully extracted artifacts via Gemini")
-            return self._parse_extraction(extracted, transcript)
-            
-        except Exception as e:
-            logger.error(f"Gemini extraction failed: {e}")
-            raise RuntimeError(f"Failed to extract artifacts: {e}") from e
+                logger.info(
+                    "Gemini extraction attempt %d (temperature=%.1f)",
+                    attempt, temp,
+                )
+                raw = await self._call_gemini(prompt, temperature=temp)
+                validated = validate_llm_response(raw)
+                artifacts = to_meeting_artifacts(validated, transcript)
+                logger.info("Gemini extraction succeeded on attempt %d", attempt)
+                return artifacts
+            except (ValueError, ValidationError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Extraction validation failed (attempt %d): %s",
+                    attempt, exc,
+                )
+            except Exception as exc:
+                logger.error("Gemini extraction failed: %s", exc)
+                raise RuntimeError(
+                    f"Failed to extract artifacts: {exc}"
+                ) from exc
+
+        raise RuntimeError(
+            f"LLM response validation failed after "
+            f"{len(temperatures)} attempts: {last_error}"
+        ) from last_error
+
+    async def generate_text(self, prompt: str) -> str:
+        """Send a free-form prompt to Gemini and return the raw text."""
+        return await self._call_gemini(prompt, max_output_tokens=4096)
 
 
 class OpenAIProvider(LLMProvider):
@@ -408,51 +280,93 @@ class OpenAIProvider(LLMProvider):
                 ) from e
         return self._client
     
-    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
-        """Extract artifacts using OpenAI API."""
+    @retry(
+        retry=retry_if_exception_type(_LLM_RETRYABLE),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        reraise=True,
+    )
+    async def _call_openai(
+        self,
+        messages: list[dict],
+        *,
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+    ) -> str:
+        """Call OpenAI with retry and timeout; return raw response text."""
         client = self._get_client()
-        prompt = self._build_extraction_prompt(transcript)
-        
-        try:
-            logger.info(f"Calling OpenAI API ({self.model}) for artifact extraction")
-            
-            # Call OpenAI API in thread pool to not block async
+        kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        async with asyncio.timeout(_LLM_CALL_TIMEOUT):
             response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert Agile Project Manager assistant. Always respond with valid JSON only, no markdown formatting."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.2,
-                max_tokens=4096,
-                response_format={"type": "json_object"},
+                client.chat.completions.create, **kwargs
             )
-            
-            if not response.choices or not response.choices[0].message.content:
-                raise RuntimeError("OpenAI API returned empty response")
-            
-            json_text = response.choices[0].message.content
-            
+        if not response.choices or not response.choices[0].message.content:
+            raise RuntimeError("OpenAI API returned empty response")
+        return response.choices[0].message.content
+
+    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
+        """Extract artifacts using OpenAI with validation and retry.
+
+        Attempts extraction at temperature 0.1 with JSON mode. If the
+        response fails validation, retries at temperature 0.0.
+        """
+        prompt = build_extraction_prompt(transcript)
+        system_msg = (
+            "You are an elite Agile Scrum Master and Meeting Analyst. "
+            "Always respond with valid JSON only, no markdown formatting."
+        )
+        temperatures = [0.1, 0.0]
+        last_error: Exception | None = None
+
+        for attempt, temp in enumerate(temperatures, 1):
             try:
-                extracted = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse OpenAI response as JSON: {e}")
-                logger.error(f"Raw response: {json_text[:500]}...")
-                raise RuntimeError(f"Failed to parse LLM response as JSON: {e}") from e
-            
-            logger.info("Successfully extracted artifacts via OpenAI")
-            return self._parse_extraction(extracted, transcript)
-            
-        except Exception as e:
-            logger.error(f"OpenAI extraction failed: {e}")
-            raise RuntimeError(f"Failed to extract artifacts: {e}") from e
+                logger.info(
+                    "OpenAI extraction attempt %d (%s, temperature=%.1f)",
+                    attempt, self.model, temp,
+                )
+                messages = [
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ]
+                raw = await self._call_openai(
+                    messages, temperature=temp, json_mode=True,
+                )
+                validated = validate_llm_response(raw)
+                artifacts = to_meeting_artifacts(validated, transcript)
+                logger.info("OpenAI extraction succeeded on attempt %d", attempt)
+                return artifacts
+            except (ValueError, ValidationError) as exc:
+                last_error = exc
+                logger.warning(
+                    "Extraction validation failed (attempt %d): %s",
+                    attempt, exc,
+                )
+            except Exception as exc:
+                logger.error("OpenAI extraction failed: %s", exc)
+                raise RuntimeError(
+                    f"Failed to extract artifacts: {exc}"
+                ) from exc
+
+        raise RuntimeError(
+            f"LLM response validation failed after "
+            f"{len(temperatures)} attempts: {last_error}"
+        ) from last_error
+
+    async def generate_text(self, prompt: str) -> str:
+        """Send a free-form prompt to OpenAI and return the raw text."""
+        messages = [
+            {"role": "system", "content": "You are a senior technical meeting analyst."},
+            {"role": "user", "content": prompt},
+        ]
+        return await self._call_openai(messages)
 
 
 def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExtractor":  # type: ignore[name-defined]

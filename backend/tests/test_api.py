@@ -1,4 +1,4 @@
-"""Tests for FastAPI endpoints: POST /upload, GET /status/{job_id}."""
+"""Tests for FastAPI endpoints: GET /, POST /upload, GET /status/{job_id}."""
 
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -8,8 +8,10 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
-from app.main import app, get_job_store
+from app.main import app, get_job_store, get_job_queue, get_s3_service
+from app.infrastructure.db import get_async_session
 from app.models import JobResponse, ProcessingStatus
+from app.models.db_models import JobRecord
 
 
 SAMPLE_JOB_ID = UUID("12345678-1234-5678-1234-567812345678")
@@ -17,7 +19,7 @@ SAMPLE_JOB_ID = UUID("12345678-1234-5678-1234-567812345678")
 
 @pytest.fixture
 def mock_job_store(sample_job_response):
-    """In-memory mock implementing the RedisJobStore interface."""
+    """In-memory mock implementing the PostgresJobStore interface."""
     store = AsyncMock()
     store.save = AsyncMock()
     store.load = AsyncMock(return_value=sample_job_response)
@@ -29,39 +31,45 @@ def mock_job_store(sample_job_response):
 
 
 @pytest.fixture
-def mock_arq_pool():
-    """Mock the ARQ connection pool used for job enqueueing."""
-    pool = AsyncMock()
-    arq_job = MagicMock()
-    arq_job.job_id = str(SAMPLE_JOB_ID)
-    pool.enqueue_job = AsyncMock(return_value=arq_job)
-    pool.close = AsyncMock()
-    return pool
+def mock_job_queue():
+    """Mock the PostgresJobQueue used for job enqueueing."""
+    queue = AsyncMock()
+    record = MagicMock(spec=JobRecord)
+    record.id = SAMPLE_JOB_ID
+    record.message = "Job queued"
+    record.progress = 0
+    queue.enqueue_job = AsyncMock(return_value=record)
+    return queue
+
+
+@pytest.fixture
+def mock_s3_service():
+    """Mock S3StorageService for upload operations."""
+    s3 = AsyncMock()
+    s3.upload_stream = AsyncMock()
+    return s3
+
+
+@pytest.fixture
+def mock_db_session():
+    """Mock async DB session."""
+    session = AsyncMock()
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    return session
 
 
 @pytest_asyncio.fixture
-async def client(mock_job_store, mock_arq_pool):
+async def client(mock_job_store, mock_job_queue, mock_s3_service, mock_db_session):
     """
     Yield an httpx.AsyncClient wired to the FastAPI app with mocked
-    job store and ARQ pool dependencies.
-
-    Uses FastAPI's dependency_overrides so the real RedisJobStore is
-    never instantiated (avoids Redis pipeline calls on the mock).
+    dependencies (Postgres job store, queue, S3, and DB session).
     """
     app.dependency_overrides[get_job_store] = lambda: mock_job_store
+    app.dependency_overrides[get_job_queue] = lambda: mock_job_queue
+    app.dependency_overrides[get_async_session] = lambda: mock_db_session
 
-    with (
-        patch(
-            "app.main.check_redis_health",
-            new_callable=AsyncMock,
-            return_value={"status": "healthy"},
-        ),
-        patch(
-            "app.main.get_arq_pool",
-            new_callable=AsyncMock,
-            return_value=mock_arq_pool,
-        ),
-    ):
+    with patch("app.main.get_s3_service", return_value=mock_s3_service):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac
@@ -78,14 +86,14 @@ async def test_root_returns_service_info(client):
 
     body = response.json()
     assert body["service"] == "Meetolog API"
-    assert body["version"] == "2.0.0"
+    assert body["version"] == "3.0.0"
     assert body["status"] == "healthy"
 
 
 # POST /upload
 
 @pytest.mark.asyncio
-async def test_upload_audio_returns_job_id(client, mock_job_store, mock_arq_pool):
+async def test_upload_audio_returns_job_id(client, mock_job_queue):
     audio_bytes = b"\x00" * 1024
     files = {"file": ("test.wav", BytesIO(audio_bytes), "audio/wav")}
 
@@ -97,8 +105,7 @@ async def test_upload_audio_returns_job_id(client, mock_job_store, mock_arq_pool
     assert body["status"] == "uploading"
     assert body["progress"] == 0
 
-    mock_job_store.save.assert_awaited_once()
-    mock_arq_pool.enqueue_job.assert_awaited_once()
+    mock_job_queue.enqueue_job.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -119,17 +126,15 @@ async def test_upload_rejects_missing_filename(client):
 
 
 @pytest.mark.asyncio
-async def test_upload_returns_503_when_arq_unavailable(
-    client, mock_job_store, mock_arq_pool
-):
-    mock_arq_pool.enqueue_job.side_effect = ConnectionError("Redis down")
+async def test_upload_returns_502_when_s3_unavailable(client, mock_s3_service):
+    mock_s3_service.upload_stream.side_effect = ConnectionError("S3 down")
 
     audio_bytes = b"\x00" * 1024
     files = {"file": ("test.mp3", BytesIO(audio_bytes), "audio/mpeg")}
 
     response = await client.post("/upload", files=files)
-    assert response.status_code == 503
-    assert "queue unavailable" in response.json()["detail"].lower()
+    assert response.status_code == 502
+    assert "storage" in response.json()["detail"].lower()
 
 
 # GET /status/{job_id}

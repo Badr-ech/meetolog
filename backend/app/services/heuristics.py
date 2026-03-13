@@ -76,6 +76,11 @@ _FIELD_SPECS: dict[str, dict[str, bool]] = {
         "description": False,
         "assignee": True,
     },
+    "idea": {
+        "idea_description": False,
+        "proposed_by": True,
+        "potential_impact": False,
+    },
     "execution_task": {
         "title": False,
         "description": False,
@@ -172,6 +177,7 @@ def backfill_confidence_scores(artifacts: MeetingArtifacts) -> None:
         ("decisions", "decision"),
         ("blockers", "blocker"),
         ("action_items", "action_item"),
+        ("ideas", "idea"),
         ("execution_tasks", "execution_task"),
     ]
 

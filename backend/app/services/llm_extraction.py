@@ -1,397 +1,360 @@
 """
-LLM-based semantic extraction service using Google Gemini API.
-Extracts structured Agile artifacts from meeting transcripts.
+Unified intelligence pipeline — hierarchical summarization, RAG,
+compression, and structured artifact extraction.
 
-Implements the LLMExtractor interface for dependency injection.
+Orchestrates the full intelligence layer for long meeting transcripts:
+
+1. **Conditional Routing** — short transcripts bypass summarization
+   and go straight to the provider's extraction prompt.
+2. **Concurrent Processing** — for long transcripts, hierarchical
+   Map-Reduce summarization and RAG transcript indexing run in
+   parallel via ``asyncio.gather``.
+3. **Context Compression** — the condensed summary is filtered through
+   semantic scoring to remove filler and prioritise high-density
+   actionable segments.
+4. **RAG-Augmented Extraction** — per-artifact-category top-K segments
+   are retrieved from the transcript index and injected alongside the
+   compressed summary into the extraction prompt.
+5. **Validation & Fallback** — the underlying provider handles
+   temperature-fallback retries and Pydantic schema enforcement.
 """
 
+from __future__ import annotations
+
 import asyncio
-import json
-from datetime import datetime
+from typing import Awaitable, Callable
+from uuid import UUID
 
 import structlog
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
-from ..interfaces import LLMExtractor
-from ..models import (
-    ActionableTask,
-    MeetingArtifacts,
-    UserStory,
-    Task,
-    Decision,
-    Blocker,
-    ActionItem,
-    Priority,
+from ..config import get_settings
+from ..core.prompts import (
+    CHUNK_SUMMARIZATION_PROMPT,
+    MERGE_SUMMARIZATION_PROMPT,
+    RAG_AUGMENTED_EXTRACTION_CONTEXT,
 )
-from .heuristics import calculate_artifact_confidence
+from ..models import MeetingArtifacts
+from ..utils.text_chunking import (
+    chunk_transcript,
+    count_tokens,
+    needs_hierarchical_summarization,
+)
 
 logger = structlog.get_logger(__name__)
 
-# Timeout for a single LLM API call (seconds).
-LLM_CALL_TIMEOUT_SECONDS = 60
-
-# Transient errors worth retrying.
-_LLM_RETRYABLE = (ConnectionError, TimeoutError, asyncio.TimeoutError)
-
-# Lazy import google.generativeai to allow mock mode without API key
-_genai = None
+# Async callback type for reporting pipeline stage transitions.
+# Signature: (stage_name: str, detail_message: str) -> None
+StageCallback = Callable[[str, str], Awaitable[None]]
 
 
-def _get_genai():
-    global _genai
-    if _genai is None:
-        try:
-            import google.generativeai as genai
-            _genai = genai
-        except ImportError as e:
-            logger.error(f"Failed to import google.generativeai: {e}")
-            raise RuntimeError(
-                "google-generativeai is not installed. Install it with: pip install google-generativeai\n"
-                "Or set TEST_MODE=true to use mock extraction."
-            ) from e
-    return _genai
+# ======================================================================
+# Unified Intelligence Pipeline
+# ======================================================================
 
+class HierarchicalExtractor:
+    """Map-Reduce extraction pipeline for long meeting transcripts.
 
-class GeminiExtractor(LLMExtractor):
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError(
-                "GEMINI_API_KEY is required for GeminiExtractor. "
-                "Set TEST_MODE=true to use mock extraction instead."
-            )
-        
-        self.api_key = api_key
-        self._model = None
-        logger.info("GeminiExtractor initialized")
-    
+    When a transcript exceeds ``hierarchical_token_threshold`` tokens the
+    pipeline proceeds as:
+
+    1. **Chunk** — split the transcript into token-bounded blocks with
+       configurable overlap.
+    2. **Map (Level 1)** — summarise each chunk concurrently using the
+       underlying LLM provider, retaining all actionable artifacts.
+    3. **Reduce (Level 2+)** — if the concatenated chunk summaries still
+       exceed ``hierarchical_max_summary_tokens``, recursively merge them
+       until the text fits.
+    4. **Extract** — pass the condensed summary (or the original transcript
+       when short enough) through the provider's structured artifact
+       extraction prompt.
+
+    The class wraps *any* ``LLMProvider`` (Gemini, OpenAI, Mock) and is
+    fully compatible with the existing stateless worker pipeline.
+    """
+
+    def __init__(self, provider):
+        """Initialise the orchestrator with an ``LLMProvider`` instance."""
+        from .llm_engine import LLMProvider
+        if not isinstance(provider, LLMProvider):
+            # Duck-typing fallback for MockExtractor
+            if not (hasattr(provider, "extract_artifacts") and hasattr(provider, "generate_text")):
+                raise TypeError(
+                    f"provider must be an LLMProvider or duck-compatible, got {type(provider).__name__}"
+                )
+        self._provider = provider
+        self._settings = get_settings()
+        self._logger = structlog.get_logger(
+            __name__, component="hierarchical_extractor"
+        )
+
     @property
     def is_mock(self) -> bool:
-        """This is a real implementation."""
-        return False
-    
-    def _get_model(self):
-        if self._model is None:
-            genai = _get_genai()
-            logger.info("gemini_model_init")
-            genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel("gemini-2.5-flash-lite")
-            logger.info("gemini_model_ready")
-        return self._model
-    
-    def _build_extraction_prompt(self, transcript: str) -> str:
-        return f"""You are an expert Agile Project Manager assistant analyzing a meeting transcript.
-Your task is to extract all relevant Agile artifacts from the transcript and return them as strictly valid JSON.
+        return self._provider.is_mock
 
-TRANSCRIPT:
----
-{transcript}
----
-
-INSTRUCTIONS:
-1. Identify all USER STORIES mentioned (look for "As a...", feature requests, user needs, or requirements)
-2. Identify all TASKS (specific work items, assignments, to-dos, action items assigned to people)
-3. Identify all DECISIONS made (agreements, choices, determinations, conclusions reached)
-4. Identify all BLOCKERS (impediments, dependencies, things preventing progress, issues raised)
-5. Identify all ACTION ITEMS (follow-ups that don't fit other categories)
-6. Extract participant names mentioned in the transcript
-7. Estimate story points for user stories using Fibonacci sequence (1, 2, 3, 5, 8, 13)
-8. Assign priorities based on context and urgency (low, medium, high, critical)
-9. Generate a concise 2-3 sentence summary of the meeting
-10. For each artifact, include a 'confidence_score' between 0.0 and 1.0 representing how explicitly this item was discussed in the meeting.
-
-CRITICAL: Return ONLY valid JSON with no additional text, markdown formatting, or explanation.
-The response must be parseable by json.loads() directly.
-
-Required JSON structure:
-{{
-    "meeting_title": "string - infer an appropriate title from the meeting content",
-    "summary": "string - 2-3 sentence summary of the meeting",
-    "participants": ["list of participant names mentioned"],
-    "user_stories": [
-        {{
-            "title": "string - brief descriptive title",
-            "as_a": "user role",
-            "i_want": "desired action or feature",
-            "so_that": "benefit or value",
-            "acceptance_criteria": ["list of acceptance criteria if mentioned"],
-            "priority": "low|medium|high|critical",
-            "story_points": null or number (1, 2, 3, 5, 8, 13),
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ],
-    "tasks": [
-        {{
-            "title": "string - brief task description",
-            "description": "string - detailed description",
-            "assignee": "name or null if not assigned",
-            "priority": "low|medium|high|critical",
-            "due_date": "string or null if not mentioned",
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ],
-    "decisions": [
-        {{
-            "title": "string - decision summary",
-            "description": "string - full decision details",
-            "made_by": "name or null",
-            "rationale": "string - reason for the decision",
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ],
-    "blockers": [
-        {{
-            "title": "string - blocker summary",
-            "description": "string - details about the blocker",
-            "affected_tasks": ["list of affected task titles"],
-            "owner": "name responsible for resolving or null",
-            "resolution_plan": "string - proposed solution if discussed",
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ],
-    "action_items": [
-        {{
-            "description": "string - what needs to be done",
-            "assignee": "name or null",
-            "due_date": "string or null",
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ],
-    "execution_tasks": [
-        {{
-            "title": "string - concise task title",
-            "description": "string - detailed description of work required",
-            "owner_role": "string - responsible role (Engineering, Design, Product, DevOps, QA) or specific name",
-            "priority": "High|Medium|Low",
-            "task_source": "Explicit|Inferred",
-            "dependencies": ["list of other tasks or conditions this depends on"],
-            "confidence_score": 0.0 to 1.0 or null
-        }}
-    ]
-}}
-
-### Task Extraction & Inference Protocol
-You must analyze the transcript to generate a list of 'execution_tasks'.
-1.  **Explicit Tasks:** Identify clearly stated action items (e.g., "John will update the API").
-2.  **Inferred Tasks:** Deduce necessary work based on Decisions or Blockers.
-    *   *Example:* If a decision is "Switch to Postgres," infer a task: "Provision Postgres instance" (Role: DevOps).
-    *   *Example:* If a blocker is "Missing UI designs," infer a task: "Finalize UI Mocks" (Role: Design).
-3.  **Schema Enforcement:**
-    *   Assign a logical `owner_role` based on the task nature if a person isn't named.
-    *   Set `task_source` to 'Explicit' or 'Inferred' accordingly.
-    *   **Anti-Hallucination:** Do not invent tasks for features not discussed. Only infer steps necessary to achieve the meeting's stated goals.
-
-If no items exist for a category, return an empty array [].
-Now analyze the transcript and return the JSON:"""
-
-    async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
-        """
-        Extract Agile artifacts from a meeting transcript using Gemini.
-        
-        Args:
-            transcript: The meeting transcript text
-            
-        Returns:
-            MeetingArtifacts with all extracted information
-            
-        Raises:
-            RuntimeError: If the API call fails or response cannot be parsed
-        """
-        model = self._get_model()
-        prompt = self._build_extraction_prompt(transcript)
-        
-        try:
-            logger.info("llm_extraction_start")
-            
-            genai = _get_genai()
-            
-            response = await self._call_llm_with_retry(model, prompt, genai)
-            
-            if not response or not response.text:
-                raise RuntimeError("Gemini API returned empty response")
-            
-            # Parse the JSON response
-            json_text = response.text.strip()
-            
-            # Remove markdown code blocks if present
-            if json_text.startswith("```"):
-                lines = json_text.split("\n")
-                # Remove first line (```json) and last line (```)
-                json_text = "\n".join(lines[1:-1]) if len(lines) > 2 else json_text
-                json_text = json_text.strip()
-            
-            try:
-                extracted = json.loads(json_text)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Gemini response as JSON: {e}")
-                logger.error(f"Raw response: {json_text[:500]}...")
-                raise RuntimeError(f"Failed to parse LLM response as JSON: {e}") from e
-            
-            logger.info("llm_extraction_success")
-            return self._parse_extraction(extracted, transcript)
-            
-        except Exception as e:
-            logger.error("llm_extraction_failed", error=str(e))
-            raise RuntimeError(f"Failed to extract artifacts: {e}") from e
-    
-    @retry(
-        retry=retry_if_exception_type(_LLM_RETRYABLE),
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=30),
-        reraise=True,
-    )
-    async def _call_llm_with_retry(self, model, prompt: str, genai):
-        """Call the Gemini API with retry and timeout protection."""
-        async with asyncio.timeout(LLM_CALL_TIMEOUT_SECONDS):
-            return await asyncio.to_thread(
-                model.generate_content,
-                prompt,
-                generation_config=genai.types.GenerationConfig(
-                    temperature=0.2,
-                    max_output_tokens=4096,
-                ),
-            )
-    
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def _safe_confidence(raw: object) -> float | None:
-        """Coerce an LLM-provided confidence value to a float or None."""
-        if raw is None:
+    def _get_session_factory(self):
+        """Return the async session factory when pgvector backend is active."""
+        if self._settings.rag_storage_backend != "pgvector":
             return None
-        try:
-            val = float(raw)
-            if 0.0 <= val <= 1.0:
-                return round(val, 2)
-            return None  # out of range → treat as missing
-        except (TypeError, ValueError):
-            return None
+        from ..infrastructure.db import get_session_factory
+        return get_session_factory()
 
-    @staticmethod
-    def _inject_scores(items: list[dict], artifact_type: str) -> None:
-        """Mutate *items* in-place, filling missing confidence_score via heuristic."""
-        for item in items:
-            parsed = GeminiExtractor._safe_confidence(item.get("confidence_score"))
-            if parsed is not None:
-                item["confidence_score"] = parsed
-            else:
-                item["confidence_score"] = calculate_artifact_confidence(item, artifact_type)
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
-    def _parse_extraction(self, data: dict, transcript: str) -> MeetingArtifacts:
-        """Parse the LLM JSON response into Pydantic models."""
-        
-        def parse_priority(p: str) -> Priority:
-            mapping = {
-                "low": Priority.LOW,
-                "medium": Priority.MEDIUM,
-                "high": Priority.HIGH,
-                "critical": Priority.CRITICAL
-            }
-            return mapping.get(p.lower() if p else "medium", Priority.MEDIUM)
+    async def extract_artifacts(
+        self,
+        transcript: str,
+        *,
+        job_id: UUID | None = None,
+        on_stage: StageCallback | None = None,
+    ) -> MeetingArtifacts:
+        """Run the unified intelligence pipeline.
 
-        # --- Inject heuristic scores where the LLM omitted them ----------
-        raw_stories = data.get("user_stories", [])
-        raw_tasks = data.get("tasks", [])
-        raw_decisions = data.get("decisions", [])
-        raw_blockers = data.get("blockers", [])
-        raw_action_items = data.get("action_items", [])
-        raw_execution = data.get("execution_tasks", [])
+        Pipeline stages (long transcripts only):
 
-        self._inject_scores(raw_stories, "user_story")
-        self._inject_scores(raw_tasks, "task")
-        self._inject_scores(raw_decisions, "decision")
-        self._inject_scores(raw_blockers, "blocker")
-        self._inject_scores(raw_action_items, "action_item")
-        self._inject_scores(raw_execution, "execution_task")
+        1. **summarizing** — Hierarchical Map-Reduce summarization
+           and RAG index build run concurrently.
+        2. **compressing** — Context compression filters filler and
+           prioritises high-density actionable segments.
+        3. **retrieving** — Per-artifact-category top-K segments are
+           retrieved from the transcript index.
+        4. **extracting** — The provider's structured extraction prompt
+           receives the compressed summary + RAG segments.
 
-        user_stories = [
-            UserStory(
-                title=s.get("title", ""),
-                as_a=s.get("as_a", ""),
-                i_want=s.get("i_want", ""),
-                so_that=s.get("so_that", ""),
-                acceptance_criteria=s.get("acceptance_criteria", []),
-                priority=parse_priority(s.get("priority", "medium")),
-                story_points=s.get("story_points"),
-                confidence_score=s.get("confidence_score"),
-            )
-            for s in raw_stories
-        ]
-        
-        tasks = [
-            Task(
-                title=t.get("title", ""),
-                description=t.get("description", ""),
-                assignee=t.get("assignee"),
-                priority=parse_priority(t.get("priority", "medium")),
-                due_date=t.get("due_date"),
-                confidence_score=t.get("confidence_score"),
-            )
-            for t in raw_tasks
-        ]
-        
-        decisions = [
-            Decision(
-                title=d.get("title", ""),
-                description=d.get("description", ""),
-                made_by=d.get("made_by"),
-                rationale=d.get("rationale", ""),
-                confidence_score=d.get("confidence_score"),
-            )
-            for d in raw_decisions
-        ]
-        
-        blockers = [
-            Blocker(
-                title=b.get("title", ""),
-                description=b.get("description", ""),
-                affected_tasks=b.get("affected_tasks", []),
-                owner=b.get("owner"),
-                resolution_plan=b.get("resolution_plan", ""),
-                confidence_score=b.get("confidence_score"),
-            )
-            for b in raw_blockers
-        ]
-        
-        action_items = [
-            ActionItem(
-                description=a.get("description", ""),
-                assignee=a.get("assignee"),
-                due_date=a.get("due_date"),
-                confidence_score=a.get("confidence_score"),
-            )
-            for a in raw_action_items
-        ]
-        
-        execution_tasks = [
-            ActionableTask(
-                title=et.get("title", ""),
-                description=et.get("description", ""),
-                owner_role=et.get("owner_role", "Engineering"),
-                priority=et.get("priority", "Medium"),
-                task_source=et.get("task_source", "Explicit"),
-                dependencies=et.get("dependencies", []),
-                confidence_score=et.get("confidence_score"),
-            )
-            for et in raw_execution
-        ]
-        
-        return MeetingArtifacts(
-            meeting_title=data.get("meeting_title", "Meeting"),
-            meeting_date=datetime.now(),
-            participants=data.get("participants", []),
-            summary=data.get("summary", ""),
-            user_stories=user_stories,
-            tasks=tasks,
-            decisions=decisions,
-            blockers=blockers,
-            action_items=action_items,
-            execution_tasks=execution_tasks,
-            transcript=transcript,
+        Short transcripts (below ``hierarchical_token_threshold``)
+        bypass stages 1–3 and go directly to the provider.
+
+        Parameters
+        ----------
+        transcript:
+            Full meeting transcript (speaker-labelled when diarization
+            is enabled).
+        job_id:
+            Job identifier — used to scope pgvector embeddings.
+        on_stage:
+            Optional async callback ``(stage_name, detail)`` invoked
+            at each pipeline stage transition.  The worker uses this
+            to write granular progress to PostgreSQL.
+        """
+        async def _notify(stage: str, detail: str) -> None:
+            if on_stage is not None:
+                await on_stage(stage, detail)
+
+        token_count = count_tokens(transcript)
+        self._logger.info(
+            "extraction_start",
+            transcript_tokens=token_count,
+            threshold=self._settings.hierarchical_token_threshold,
         )
+
+        # --- Short-transcript fast path ---
+        if not needs_hierarchical_summarization(
+            transcript, self._settings.hierarchical_token_threshold
+        ):
+            self._logger.info("direct_extraction", reason="transcript within threshold")
+            await _notify("extracting", "Extracting artifacts (direct)…")
+            return await self._provider.extract_artifacts(transcript)
+
+        # --- Long-transcript intelligence pipeline ---
+        compressor = None
+        if self._settings.compression_enabled:
+            from .compression import ContextCompressor
+            compressor = ContextCompressor(settings=self._settings)
+
+        from .rag_retrieval import build_index, retrieve_all_artifact_contexts
+
+        # Branch A: Hierarchical summarization (Map-Reduce)
+        # Branch B: RAG transcript indexing (chunk → embed → store)
+        # Both run concurrently via asyncio.gather.
+        await _notify("summarizing", "Summarizing transcript (Map-Reduce)…")
+        condensed_task = self._hierarchical_summarize(transcript)
+
+        if self._provider.is_mock:
+            condensed = await condensed_task
+            self._logger.info(
+                "hierarchical_summarization_complete",
+                original_tokens=token_count,
+                condensed_tokens=count_tokens(condensed),
+                rag="skipped_mock",
+            )
+            if compressor is not None:
+                await _notify("compressing", "Compressing context…")
+                result = compressor.compress(condensed)
+                self._logger.info(
+                    "context_compression_applied",
+                    original_tokens=result.original_tokens,
+                    compressed_tokens=result.compressed_tokens,
+                    ratio=round(result.compression_ratio, 3),
+                    segments_filtered=result.segments_filtered,
+                )
+                condensed = result.text
+            await _notify("extracting", "Extracting structured artifacts…")
+            return await self._provider.extract_artifacts(condensed)
+
+        index_task = build_index(
+            transcript,
+            settings=self._settings,
+            job_id=job_id,
+            session_factory=self._get_session_factory(),
+        )
+        condensed, rag_index = await asyncio.gather(condensed_task, index_task)
+
+        self._logger.info(
+            "hierarchical_summarization_complete",
+            original_tokens=token_count,
+            condensed_tokens=count_tokens(condensed),
+            rag_chunks=len(rag_index.chunks),
+        )
+
+        # Context compression.
+        if compressor is not None:
+            await _notify("compressing", "Compressing context…")
+            result = compressor.compress(condensed)
+            self._logger.info(
+                "context_compression_applied",
+                original_tokens=result.original_tokens,
+                compressed_tokens=result.compressed_tokens,
+                ratio=round(result.compression_ratio, 3),
+                segments_filtered=result.segments_filtered,
+            )
+            condensed = result.text
+
+        # Per-artifact RAG retrieval.
+        await _notify("retrieving", "Retrieving relevant transcript segments…")
+        artifact_contexts = await retrieve_all_artifact_contexts(
+            rag_index, settings=self._settings,
+        )
+        rag_context_block = "\n\n".join(
+            f"### {atype.replace('_', ' ').title()}\n{ctx}"
+            for atype, ctx in artifact_contexts.items()
+            if ctx
+        )
+
+        await _notify("extracting", "Extracting structured artifacts…")
+
+        if rag_context_block:
+            augmented_input = RAG_AUGMENTED_EXTRACTION_CONTEXT.format(
+                rag_context=rag_context_block,
+                condensed_summary=condensed,
+            )
+            self._logger.info(
+                "rag_augmented_extraction",
+                rag_context_tokens=count_tokens(rag_context_block),
+                augmented_input_tokens=count_tokens(augmented_input),
+            )
+            return await self._provider.extract_artifacts(augmented_input)
+
+        # Fallback: no RAG context retrieved (e.g. embedding failure).
+        self._logger.warning("rag_no_context_retrieved", fallback="condensed_only")
+        return await self._provider.extract_artifacts(condensed)
+
+    # ------------------------------------------------------------------
+    # Map phase
+    # ------------------------------------------------------------------
+
+    async def _summarize_chunk(
+        self,
+        chunk_text: str,
+        chunk_index: int,
+        total_chunks: int,
+        semaphore: asyncio.Semaphore,
+    ) -> str:
+        """Summarise a single chunk behind a concurrency semaphore."""
+        async with semaphore:
+            prompt = CHUNK_SUMMARIZATION_PROMPT.format(
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+                chunk_text=chunk_text,
+            )
+            self._logger.info(
+                "chunk_summarization_start",
+                chunk=chunk_index,
+                total=total_chunks,
+                tokens=count_tokens(chunk_text),
+            )
+            summary = await self._provider.generate_text(prompt)
+            self._logger.info(
+                "chunk_summarization_done",
+                chunk=chunk_index,
+                summary_tokens=count_tokens(summary),
+            )
+            return summary
+
+    # ------------------------------------------------------------------
+    # Reduce phase
+    # ------------------------------------------------------------------
+
+    async def _merge_summaries(self, summaries: list[str]) -> str:
+        """Merge a list of summaries into a single condensed text."""
+        combined = "\n\n---\n\n".join(
+            f"[Segment {i + 1}]\n{s}" for i, s in enumerate(summaries)
+        )
+        prompt = MERGE_SUMMARIZATION_PROMPT.format(
+            num_summaries=len(summaries),
+            combined_summaries=combined,
+        )
+        self._logger.info(
+            "merge_start",
+            num_summaries=len(summaries),
+            combined_tokens=count_tokens(combined),
+        )
+        merged = await self._provider.generate_text(prompt)
+        self._logger.info(
+            "merge_done", merged_tokens=count_tokens(merged)
+        )
+        return merged
+
+    # ------------------------------------------------------------------
+    # Full hierarchical pipeline
+    # ------------------------------------------------------------------
+
+    async def _hierarchical_summarize(self, transcript: str) -> str:
+        """Run the complete Map → Reduce pipeline and return condensed text."""
+        settings = self._settings
+
+        # --- Map ---
+        chunks = chunk_transcript(
+            transcript,
+            max_chunk_tokens=settings.hierarchical_chunk_max_tokens,
+            overlap_tokens=settings.hierarchical_chunk_overlap_tokens,
+        )
+        self._logger.info("chunking_done", num_chunks=len(chunks))
+
+        semaphore = asyncio.Semaphore(settings.hierarchical_concurrency_limit)
+        tasks = [
+            self._summarize_chunk(chunk, idx + 1, len(chunks), semaphore)
+            for idx, chunk in enumerate(chunks)
+        ]
+        summaries: list[str] = await asyncio.gather(*tasks)
+
+        # --- Reduce (recursive) ---
+        merged_text = "\n\n".join(summaries)
+        reduce_level = 1
+        while count_tokens(merged_text) > settings.hierarchical_max_summary_tokens:
+            self._logger.info(
+                "reduce_pass",
+                level=reduce_level,
+                tokens=count_tokens(merged_text),
+                threshold=settings.hierarchical_max_summary_tokens,
+            )
+            # Re-chunk the merged summaries and summarize again.
+            reduction_chunks = chunk_transcript(
+                merged_text,
+                max_chunk_tokens=settings.hierarchical_chunk_max_tokens,
+                overlap_tokens=settings.hierarchical_chunk_overlap_tokens,
+            )
+            if len(reduction_chunks) <= 1:
+                # Cannot reduce further — single chunk already.
+                break
+
+            sem = asyncio.Semaphore(settings.hierarchical_concurrency_limit)
+            reduce_tasks = [
+                self._summarize_chunk(rc, idx + 1, len(reduction_chunks), sem)
+                for idx, rc in enumerate(reduction_chunks)
+            ]
+            reduction_summaries = await asyncio.gather(*reduce_tasks)
+            merged_text = await self._merge_summaries(reduction_summaries)
+            reduce_level += 1
+
+        return merged_text

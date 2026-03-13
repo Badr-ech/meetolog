@@ -35,11 +35,26 @@ alembic>=1.13.0
 python-dotenv>=1.0.0
 aiosqlite>=0.20.0  # For testing with in-memory SQLite
 
+# Token counting for hierarchical summarization
+tiktoken>=0.7.0
+
+# Vector math for RAG retrieval (transitive via torch, pinned explicitly)
+numpy>=1.24.0
+
+# Persistent vector storage (required only when RAG_STORAGE_BACKEND=pgvector)
+pgvector>=0.3.0
+
 # Retry / resilience
 tenacity>=9.0.0
 
+# JSON repair for malformed LLM responses
+json-repair>=0.30.0
+
 # Structured logging
 structlog>=24.1.0
+
+# Speaker diarization (requires HuggingFace token + model agreement)
+pyannote.audio>=3.1.0
 
 # Whisper dependencies (torch is auto-installed by openai-whisper)
 # ffmpeg-python  # Optional: uncomment if you need programmatic ffmpeg access

@@ -99,7 +99,7 @@ class TestParseExtraction:
         p = self._make_provider()
         artifacts = p._parse_extraction({}, "")
         assert isinstance(artifacts, MeetingArtifacts)
-        assert artifacts.meeting_title == "Meeting"
+        assert artifacts.meeting_title == "Untitled Meeting"
 
     def test_null_assignees_handled(self):
         p = self._make_provider()

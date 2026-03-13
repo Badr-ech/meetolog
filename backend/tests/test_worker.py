@@ -1,220 +1,157 @@
-"""Tests for ARQ worker tasks: process_audio_job pipeline stages."""
+"""Tests for PostgreSQL worker pipeline: process_job stages."""
 
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
-import pytest_asyncio
 
 from app.models import MeetingArtifacts, ProcessingStatus
+from app.worker import process_job
 
 
-SAMPLE_JOB_ID = "12345678-1234-5678-1234-567812345678"
-
-
-@pytest.fixture
-def mock_job_store():
-    """Mock RedisJobStore with all methods used by the worker pipeline."""
-    store = AsyncMock()
-    store.update = AsyncMock(return_value=None)
-    store.update_job_stage = AsyncMock(return_value=None)
-    store.get_cached_transcript = AsyncMock(return_value=None)
-    store.get_cached_artifacts = AsyncMock(return_value=None)
-    store.cache_transcript = AsyncMock()
-    store.cache_artifacts = AsyncMock()
-    store.store_audio = AsyncMock(return_value=True)
-    store.get_stored_audio = AsyncMock(return_value=None)
-    store.delete_stored_audio = AsyncMock()
-    store.get_completed_chunk_indices = AsyncMock(return_value=(set(), 0))
-    store.save_chunk_transcript = AsyncMock()
-    store.assemble_transcript_from_chunks = AsyncMock(return_value="Full transcript.")
-    store.delete_chunk_data = AsyncMock()
-    return store
+SAMPLE_JOB_ID = UUID("12345678-1234-5678-1234-567812345678")
+SAMPLE_S3_KEY = "uploads/12345678-1234-5678-1234-567812345678.wav"
 
 
 @pytest.fixture
-def worker_ctx(mock_job_store):
-    """Minimal ARQ context dict injected into each task."""
-    return {"job_store": mock_job_store, "redis": AsyncMock()}
+def mock_queue():
+    """Mock PostgresJobQueue with all methods used by process_job."""
+    queue = AsyncMock()
+    queue.update_job_progress = AsyncMock()
+    queue.mark_job_completed = AsyncMock()
+    queue.mark_job_failed = AsyncMock()
+    return queue
 
 
 @pytest.fixture
-def tmp_audio(tmp_path) -> Path:
-    """Create a temporary audio file on disk."""
-    audio_file = tmp_path / "test_audio.wav"
-    audio_file.write_bytes(b"\x00" * 2048)
-    return audio_file
+def mock_s3_service(tmp_path):
+    """Mock S3StorageService that writes a dummy audio file on download."""
+    s3 = AsyncMock()
+
+    async def _fake_download(s3_key: str, dest_path: str) -> None:
+        Path(dest_path).write_bytes(b"\x00" * 2048)
+
+    s3.download_to_file = AsyncMock(side_effect=_fake_download)
+    s3.upload_pdf = AsyncMock(return_value="results/test.pdf")
+    s3.upload_artifacts_json = AsyncMock(return_value="results/test.json")
+    return s3
 
 
-# process_audio_job â€” full pipeline (mocked services)
+# process_job — full pipeline (mocked services)
 
 @pytest.mark.asyncio
-async def test_process_audio_job_completes_pipeline(
-    worker_ctx,
-    mock_job_store,
-    tmp_audio,
-    sample_artifacts,
+async def test_process_job_completes_pipeline(
+    mock_queue, mock_s3_service, sample_artifacts
 ):
     """Verify the pipeline reaches COMPLETED and persists artifacts."""
-
     mock_transcriber = AsyncMock()
     mock_transcriber.transcribe = AsyncMock(return_value="Full transcript.")
 
-    mock_llm = AsyncMock()
-    mock_llm.extract_artifacts = AsyncMock(return_value=sample_artifacts)
+    mock_extractor = AsyncMock()
+    mock_extractor.extract_artifacts = AsyncMock(return_value=sample_artifacts)
 
     mock_pdf_service = AsyncMock()
     mock_pdf_service.generate = AsyncMock(return_value=Path("/tmp/meeting.pdf"))
 
     with (
-        patch("app.worker.get_transcriber", return_value=mock_transcriber),
-        patch("app.worker.get_llm_provider", return_value=mock_llm),
-        patch("app.worker.get_pdf_service", return_value=mock_pdf_service),
-        patch("app.services.transcription.compress_audio_for_storage", return_value=b"\x00" * 100),
+        patch("app.worker._get_transcriber", return_value=mock_transcriber),
+        patch("app.worker._get_llm_provider", return_value=mock_extractor),
+        patch("app.worker._get_pdf_service", return_value=mock_pdf_service),
     ):
-        from app.worker import process_audio_job
-
-        result = await process_audio_job(
-            ctx=worker_ctx,
+        await process_job(
             job_id=SAMPLE_JOB_ID,
-            file_path=str(tmp_audio),
+            s3_key=SAMPLE_S3_KEY,
             file_name="test_audio.wav",
-            file_size=2048,
+            queue=mock_queue,
+            s3_service=mock_s3_service,
+            worker_id="test-worker",
         )
 
-    assert result["status"] == "completed"
-    assert result["job_id"] == SAMPLE_JOB_ID
-
-    completion_calls = [
-        c
-        for c in mock_job_store.update_job_stage.call_args_list
-        if c.kwargs.get("status") == ProcessingStatus.COMPLETED
-    ]
-    assert len(completion_calls) == 1
-
-    mock_llm.extract_artifacts.assert_awaited_once()
+    mock_queue.mark_job_completed.assert_awaited_once()
+    mock_extractor.extract_artifacts.assert_awaited_once()
     mock_pdf_service.generate.assert_awaited_once()
+    mock_s3_service.upload_pdf.assert_awaited_once()
+    mock_s3_service.upload_artifacts_json.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_process_audio_job_uses_cached_transcript(
-    worker_ctx, mock_job_store, tmp_audio, sample_artifacts
-):
-    """When a cached transcript exists, transcription is skipped."""
-    mock_job_store.get_cached_transcript.return_value = "Previously cached transcript"
-
-    mock_llm = AsyncMock()
-    mock_llm.extract_artifacts = AsyncMock(return_value=sample_artifacts)
-
-    mock_pdf_service = AsyncMock()
-    mock_pdf_service.generate = AsyncMock(return_value=Path("/tmp/meeting.pdf"))
-
-    with (
-        patch("app.worker.get_transcriber") as mock_get_transcriber,
-        patch("app.worker.get_llm_provider", return_value=mock_llm),
-        patch("app.worker.get_pdf_service", return_value=mock_pdf_service),
-    ):
-        from app.worker import process_audio_job
-
-        result = await process_audio_job(
-            ctx=worker_ctx,
-            job_id=SAMPLE_JOB_ID,
-            file_path=str(tmp_audio),
-            file_name="test_audio.wav",
-            file_size=2048,
-        )
-
-    assert result["status"] == "completed"
-    mock_get_transcriber.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_process_audio_job_uses_cached_artifacts(
-    worker_ctx, mock_job_store, tmp_audio, sample_artifacts
-):
-    """When cached artifacts exist, LLM extraction is skipped."""
-    mock_job_store.get_cached_transcript.return_value = "Cached transcript"
-    mock_job_store.get_cached_artifacts.return_value = sample_artifacts
-
-    mock_pdf_service = AsyncMock()
-    mock_pdf_service.generate = AsyncMock(return_value=Path("/tmp/meeting.pdf"))
-
-    with (
-        patch("app.worker.get_llm_provider") as mock_get_llm,
-        patch("app.worker.get_pdf_service", return_value=mock_pdf_service),
-    ):
-        from app.worker import process_audio_job
-
-        result = await process_audio_job(
-            ctx=worker_ctx,
-            job_id=SAMPLE_JOB_ID,
-            file_path=str(tmp_audio),
-            file_name="test_audio.wav",
-            file_size=2048,
-        )
-
-    assert result["status"] == "completed"
-    mock_get_llm.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_process_audio_job_handles_missing_file(
-    worker_ctx, mock_job_store
-):
-    """Pipeline should set FAILED when audio file does not exist and has no Redis backup."""
-    mock_job_store.get_cached_transcript.return_value = None
-    mock_job_store.get_stored_audio.return_value = None
-
-    from app.worker import process_audio_job
-
-    result = await process_audio_job(
-        ctx=worker_ctx,
-        job_id=SAMPLE_JOB_ID,
-        file_path="/nonexistent/path/audio.wav",
-        file_name="audio.wav",
-        file_size=0,
+async def test_process_job_handles_s3_download_failure(mock_queue, mock_s3_service):
+    """Pipeline should mark FAILED when S3 download raises FileNotFoundError."""
+    mock_s3_service.download_to_file = AsyncMock(
+        side_effect=FileNotFoundError("S3 key not found")
     )
 
-    assert result["status"] == "failed"
+    await process_job(
+        job_id=SAMPLE_JOB_ID,
+        s3_key=SAMPLE_S3_KEY,
+        file_name="test_audio.wav",
+        queue=mock_queue,
+        s3_service=mock_s3_service,
+        worker_id="test-worker",
+    )
 
-    failure_calls = [
-        c
-        for c in mock_job_store.update_job_stage.call_args_list
-        if c.kwargs.get("status") == ProcessingStatus.FAILED
-    ]
-    assert len(failure_calls) >= 1
+    mock_queue.mark_job_failed.assert_awaited_once()
+    error_msg = mock_queue.mark_job_failed.call_args[0][1]
+    assert "not found" in error_msg.lower()
 
 
 @pytest.mark.asyncio
-async def test_process_audio_job_handles_llm_error(
-    worker_ctx, mock_job_store, tmp_audio
-):
-    """Pipeline should set FAILED when LLM extraction raises."""
+async def test_process_job_handles_llm_error(mock_queue, mock_s3_service):
+    """Pipeline should mark FAILED when LLM extraction raises."""
     mock_transcriber = AsyncMock()
     mock_transcriber.transcribe = AsyncMock(return_value="Full transcript.")
 
-    mock_llm = AsyncMock()
-    mock_llm.extract_artifacts = AsyncMock(side_effect=RuntimeError("API quota exceeded"))
+    mock_extractor = AsyncMock()
+    mock_extractor.extract_artifacts = AsyncMock(
+        side_effect=RuntimeError("API quota exceeded")
+    )
 
     with (
-        patch("app.worker.get_transcriber", return_value=mock_transcriber),
-        patch("app.worker.get_llm_provider", return_value=mock_llm),
-        patch("app.services.transcription.compress_audio_for_storage", return_value=b"\x00"),
+        patch("app.worker._get_transcriber", return_value=mock_transcriber),
+        patch("app.worker._get_llm_provider", return_value=mock_extractor),
     ):
-        from app.worker import process_audio_job
-
-        result = await process_audio_job(
-            ctx=worker_ctx,
+        await process_job(
             job_id=SAMPLE_JOB_ID,
-            file_path=str(tmp_audio),
+            s3_key=SAMPLE_S3_KEY,
             file_name="test.wav",
-            file_size=2048,
+            queue=mock_queue,
+            s3_service=mock_s3_service,
+            worker_id="test-worker",
         )
 
-    assert result["status"] == "failed"
-    assert "API quota exceeded" in result["error"]
+    mock_queue.mark_job_failed.assert_awaited_once()
+    error_msg = mock_queue.mark_job_failed.call_args[0][1]
+    assert "API quota exceeded" in error_msg
+
+
+@pytest.mark.asyncio
+async def test_process_job_reports_progress_stages(mock_queue, mock_s3_service, sample_artifacts):
+    """Pipeline reports progress through transcription → extraction → PDF stages."""
+    mock_transcriber = AsyncMock()
+    mock_transcriber.transcribe = AsyncMock(return_value="Transcript.")
+
+    mock_extractor = AsyncMock()
+    mock_extractor.extract_artifacts = AsyncMock(return_value=sample_artifacts)
+
+    mock_pdf_service = AsyncMock()
+    mock_pdf_service.generate = AsyncMock(return_value=Path("/tmp/meeting.pdf"))
+
+    with (
+        patch("app.worker._get_transcriber", return_value=mock_transcriber),
+        patch("app.worker._get_llm_provider", return_value=mock_extractor),
+        patch("app.worker._get_pdf_service", return_value=mock_pdf_service),
+    ):
+        await process_job(
+            job_id=SAMPLE_JOB_ID,
+            s3_key=SAMPLE_S3_KEY,
+            file_name="test.wav",
+            queue=mock_queue,
+            s3_service=mock_s3_service,
+        )
+
+    # Should have multiple progress updates
+    assert mock_queue.update_job_progress.await_count >= 3
 
 
 # LLM response parsing (GeminiProvider._parse_extraction)

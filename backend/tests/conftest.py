@@ -8,6 +8,43 @@ import pytest
 import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from app.infrastructure.db import Base
+
+
+# ---------------------------------------------------------------------------
+# SQLite compatibility: map PostgreSQL JSONB to plain JSON for in-memory tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session", autouse=True)
+def _register_jsonb_for_sqlite():
+    """Teach the SQLite type compiler how to render JSONB columns."""
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "visit_JSONB"):
+        def visit_JSONB(self, type_, **kw):
+            return self.visit_JSON(type_, **kw)
+        SQLiteTypeCompiler.visit_JSONB = visit_JSONB
+
+
+@pytest_asyncio.fixture
+async def sqlite_engine():
+    """Create an in-memory async SQLite engine with all tables provisioned."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def sqlite_session(sqlite_engine):
+    """Yield a per-test async session backed by in-memory SQLite."""
+    factory = async_sessionmaker(bind=sqlite_engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+
 from app.models import (
     JobResponse,
     MeetingArtifacts,
@@ -17,6 +54,7 @@ from app.models import (
     Decision,
     Blocker,
     ActionItem,
+    Idea,
     Priority,
     TaskStatus,
 )
@@ -87,6 +125,13 @@ def sample_artifacts() -> MeetingArtifacts:
         action_items=[
             ActionItem(description="Update docs", assignee="John"),
         ],
+        ideas=[
+            Idea(
+                idea_description="Add OAuth2 social login later",
+                proposed_by="Lisa",
+                potential_impact="Increase sign-up conversion",
+            ),
+        ],
         transcript="Sample transcript text.",
     )
 
@@ -138,5 +183,12 @@ def deterministic_llm_response() -> dict:
         "blockers": [],
         "action_items": [
             {"description": "Update docs", "assignee": "John", "due_date": None},
+        ],
+        "ideas": [
+            {
+                "idea_description": "Add OAuth2 social login",
+                "proposed_by": "Lisa",
+                "potential_impact": "Improve sign-up conversion",
+            },
         ],
     }

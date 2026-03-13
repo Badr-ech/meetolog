@@ -26,6 +26,7 @@ from ..models import (
     Blocker,
     Decision,
     ActionItem,
+    Idea,
     Task,
 )
 
@@ -199,6 +200,21 @@ def _task_to_issue(task: Task) -> JiraIssue:
     )
 
 
+def _idea_to_issue(idea: Idea) -> JiraIssue:
+    description_parts = [idea.idea_description or ""]
+    if idea.potential_impact:
+        description_parts.append(f"Potential Impact: {idea.potential_impact}")
+    if idea.proposed_by:
+        description_parts.append(f"Proposed by: {idea.proposed_by}")
+
+    return JiraIssue(
+        summary=_safe_summary(f"[Idea] {idea.idea_description}"),
+        description="\n\n".join(description_parts),
+        issueType="Task",
+        labels=["meetolog", "idea"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -236,6 +252,9 @@ def map_artifacts_to_jira(
 
     for task in artifacts.tasks:
         issues.append(_task_to_issue(task))
+
+    for idea in artifacts.ideas:
+        issues.append(_idea_to_issue(idea))
 
     project = JiraProject(key=project_key, issues=issues)
     return JiraExportPayload(projects=[project])

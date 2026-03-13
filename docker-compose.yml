@@ -3,7 +3,7 @@
 #
 # Services:
 #   db              PostgreSQL 15   (job queue, metadata, artifacts)
-#   redis           Redis 7         (ARQ broker / cache)
+#   redis           Redis 7         (unused — retained for future cache needs)
 #   minio           MinIO           (local S3-compatible object store)
 #   minio-setup     mc CLI          (one-shot bucket provisioning)
 #   api             FastAPI         (HTTP API on :8000)

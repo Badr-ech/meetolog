@@ -7,6 +7,7 @@ import styles from "./JobProgress.module.css";
 /** Ordered pipeline stages rendered as dots beneath the progress bar. */
 const STAGE_ORDER = [
   "uploading",
+  "diarizing",
   "transcribing",
   "extracting",
   "generating_pdf",
@@ -16,6 +17,7 @@ const STAGE_ORDER = [
 /** Abbreviated labels for the dot indicators. */
 const STAGE_SHORT_LABELS: Record<string, string> = {
   uploading: "Upload",
+  diarizing: "Speakers",
   transcribing: "Transcribe",
   extracting: "Extract",
   generating_pdf: "PDF",

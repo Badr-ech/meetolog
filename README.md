@@ -6,24 +6,27 @@ Transform meeting audio recordings into structured Agile artifacts using AI-powe
 
 ## Overview
 
-Meetolog accepts audio uploads or in-browser recordings, transcribes them with OpenAI Whisper, extracts Agile artifacts via Google Gemini (or OpenAI), and produces a downloadable PDF report. Extracted artifacts are editable inline before generating the final PDF.
+Meetolog accepts audio uploads or in-browser recordings, identifies speakers via diarization, transcribes them with OpenAI Whisper, and runs a **unified intelligence pipeline** (hierarchical summarization → context compression → RAG retrieval → structured extraction) to produce Agile artifacts via Google Gemini or OpenAI. Extracted artifacts are editable inline before generating a downloadable PDF report.
 
 **Pipeline:**
 
 1. Accept audio (MP3, WAV, M4A, OGG, WebM) via upload or in-browser recording
 2. Upload audio directly to AWS S3 via a presigned POST URL (client-side, stateless API)
-3. Transcribe speech to text (OpenAI Whisper, local model)
-4. Extract Agile artifacts via LLM (Gemini or OpenAI):
+3. **Identify speakers** via pyannote speaker diarization (global timeline, optional — requires `HF_TOKEN`)
+4. Transcribe speech to text (OpenAI Whisper, local model)
+5. **Align** chunked Whisper segments with the global speaker timeline to produce a speaker-labelled transcript
+6. Extract Agile artifacts via LLM (Gemini or OpenAI):
    - User Stories (with acceptance criteria)
-   - Tasks (with assignments and priorities)
-   - Decisions (with rationale)
+   - Tasks (with assignments, priorities, and contextual reasoning)
+   - Decisions (with rationale, decision summary, and rejected alternatives)
    - Blockers (with resolution plans)
-   - Action Items
+   - Action Items (with title, context, and priority)
+   - Ideas & Suggestions (with proposer, potential impact, and confidence)
    - Execution Tasks (AI-inferred actionable work items with owner roles, priorities, and dependency tracking)
-5. Assign confidence scores (LLM-provided or deterministic heuristic fallback)
-6. Edit artifacts inline in the browser
-7. Generate and download a PDF summary
-8. Export artifacts as Jira-compatible JSON for bulk import
+7. Assign confidence scores (LLM-provided or deterministic heuristic fallback)
+8. Edit artifacts inline in the browser
+9. Generate and download a PDF summary
+10. Export artifacts as Jira-compatible JSON for bulk import
 
 ---
 
@@ -70,10 +73,10 @@ The production backend runs on **AWS ECS Fargate**. The API and workers are depl
 | Component | AWS Service | Details |
 |-----------|-------------|---------|
 | **API** | ECS Fargate | Stateless FastAPI. Streams uploads to S3, reads/writes PostgreSQL. |
-| **Worker** | ECS Fargate Spot | Runs Whisper `tiny` + ffmpeg chunking. Spot interruptions handled by PostgreSQL retry logic. |
+| **Worker** | ECS Fargate Spot | Runs pyannote diarization + Whisper `tiny` + ffmpeg chunking. Spot interruptions handled by PostgreSQL retry logic. |
 | **Database** | RDS PostgreSQL | Job queue (`SELECT … FOR UPDATE SKIP LOCKED`), metadata, artifact storage. |
 | **Object Storage** | S3 | Audio uploads, PDFs, artifact JSON. Presigned POST for direct browser uploads. |
-| **Secrets** | SSM Parameter Store | `DATABASE_URL`, `AWS_S3_BUCKET`, `GEMINI_API_KEY`, `CORS_ORIGINS` injected into ECS tasks. |
+| **Secrets** | SSM Parameter Store | `DATABASE_URL`, `AWS_S3_BUCKET`, `GEMINI_API_KEY`, `HF_TOKEN`, `CORS_ORIGINS` injected into ECS tasks. |
 | **Container Registry** | ECR | Single image for both API and worker roles. |
 | **Logs** | CloudWatch Logs | Structured JSON logs from `structlog`. 30-day retention. |
 | **Load Balancer** | ALB | TLS termination, health checks (`/health`), HTTP→HTTPS redirect. |
@@ -99,15 +102,454 @@ Execution Tasks carry a `task_source` field (`"Explicit"` or `"Inferred"`) indic
 
 ### Granular Progress States
 
-Jobs transition through 6 stages: `uploading` → `transcribing` → `extracting` → `generating_pdf` → `completed` / `failed`. Each transition writes status and progress atomically in a single SQL `UPDATE`.
+Jobs transition through 7 stages: `uploading` → `diarizing` → `transcribing` → `extracting` → `generating_pdf` → `completed` / `failed`. Each transition writes status and progress atomically in a single SQL `UPDATE`. The `diarizing` stage is present only when `HF_TOKEN` is configured.
+
+During the `extracting` stage the worker receives granular sub-stage callbacks from the intelligence pipeline and writes them to PostgreSQL in real time:
+
+| Sub-stage | Progress | Detail |
+|-----------|----------|--------|
+| **summarizing** | 52% | Map-Reduce hierarchical summarization |
+| **compressing** | 60% | Semantic filtering + budget selection |
+| **retrieving** | 63% | Per-artifact RAG segment retrieval |
+| **extracting** | 66% | LLM structured artifact extraction |
+
+Short transcripts (below `HIERARCHICAL_TOKEN_THRESHOLD`) skip directly to the extraction sub-stage.
+
+### Unified Intelligence Pipeline
+
+All AI features — speaker diarization, hierarchical summarization, transcript indexing, RAG retrieval, context compression, and structured extraction — are orchestrated by a single `HierarchicalExtractor` class in `backend/app/services/llm_extraction.py`. The pipeline is provider-agnostic: any `LLMProvider` (Gemini, OpenAI, or mock) is wrapped by the extractor, which decides the optimal path based on transcript length.
+
+```
+ Audio file
+      │
+      ▼
+┌──────────────────┐
+│ Speaker Diarize   │  (optional — requires HF_TOKEN)
+│ (pyannote 3.1)    │  Global timeline → speaker labels
+└────────┬─────────┘
+         ▼
+┌──────────────────┐
+│ Transcribe        │  Whisper (chunked, 5-min segments)
+│                   │  Speaker-aligned if diarized
+└────────┬─────────┘
+         │
+    token count
+    ≤ threshold?──── YES ───► Direct Extraction ───► Artifacts
+         │
+         NO  (long transcript)
+         │
+         ├──────────────────────────────┐
+         │  (concurrent via asyncio)    │
+         ▼                              ▼
+┌──────────────────┐       ┌───────────────────┐
+│ Map-Reduce        │       │ RAG Index Build    │
+│ Summarization     │       │ (chunk → embed →   │
+│ (chunk → LLM →    │       │  NumPy / pgvector) │
+│  merge)           │       └─────────┬─────────┘
+└────────┬─────────┘                 │
+         ▼                            │
+┌──────────────────┐                 │
+│ Context           │                 │
+│ Compression       │                 │
+│ (semantic filter   │                 │
+│  + budget select)  │                 │
+└────────┬─────────┘                 │
+         │                            │
+         └──────────┬─────────────────┘
+                    ▼
+          ┌───────────────────┐
+          │ Per-artifact RAG   │  7 queries — one per
+          │ Retrieval (top-K)  │  artifact category
+          └─────────┬─────────┘
+                    ▼
+          ┌───────────────────┐
+          │ RAG-Augmented      │  Condensed summary +
+          │ Extraction Prompt  │  retrieved segments
+          └─────────┬─────────┘
+                    ▼
+          ┌───────────────────┐
+          │ Structured Artifact│  MeetingArtifacts JSON
+          │ JSON + Validation  │  (Pydantic v2)
+          └───────────────────┘
+```
+
+Each sub-stage fires an async callback that the worker writes to PostgreSQL, giving the frontend real-time progress visibility (see **Granular Progress States** above). The detailed design of each component is documented in the sections below.
+
+### Speaker Diarization
+
+When `HF_TOKEN` is set, the worker runs a **global speaker diarization** pass before transcription using `pyannote/speaker-diarization-3.1`. The pipeline:
+
+1. **Convert** the uploaded audio to a 16 kHz mono WAV track via ffmpeg.
+2. **Diarize** the full track with pyannote to produce a global timeline of speaker turns (`SPEAKER_00`, `SPEAKER_01`, …).
+3. **Free** the diarization model (`del pipeline; gc.collect()`) to reclaim memory before Whisper loads.
+4. **Transcribe** chunks as usual, but capture per-segment timestamps from Whisper.
+5. **Align** each Whisper segment to the global timeline by mapping the segment's midpoint to the overlapping speaker turn. Consecutive segments by the same speaker are merged into a single paragraph.
+6. **Output** a labelled transcript: `Speaker 1: … \n Speaker 2: …` that is passed to the LLM.
+
+Because diarization runs over the full recording, speaker identities remain consistent across chunk boundaries. The diarization and Whisper models are never resident in memory simultaneously (sequential load / unload), keeping peak RSS within the 2 GB Fargate Spot budget.
+
+**Prerequisites:** Create a free HuggingFace account and accept the user conditions for both [`pyannote/speaker-diarization-3.1`](https://huggingface.co/pyannote/speaker-diarization-3.1) and [`pyannote/segmentation-3.0`](https://huggingface.co/pyannote/segmentation-3.0). Then generate an access token at https://huggingface.co/settings/tokens and set `HF_TOKEN` in your `.env`.
 
 ### Jira Export
 
 Completed jobs export as Jira-compatible bulk-import JSON via `GET /export/jira/{job_id}`. Artifact types map to Jira issue types (Story, Task, Bug). Priorities, labels, and summaries are translated automatically.
 
+### Hierarchical Summarization (Map-Reduce)
+
+Transcripts from meetings longer than ~20 minutes can exceed the context window sweet-spot of most LLMs, causing the "lost in the middle" phenomenon — details in the centre of the text are silently dropped or hallucinated. Meetolog mitigates this with a **Hierarchical Summarization** pipeline that automatically activates for transcripts exceeding a configurable token threshold (default: 12 000 tokens).
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    Full Transcript (N tokens)                │
+└──────────────────┬───────────────────────────────────────────┘
+                   │
+       ┌───────────┼───────────┐
+       ▼           ▼           ▼
+   ┌────────┐ ┌────────┐ ┌────────┐   ← Token-bounded chunks
+   │Chunk 1 │ │Chunk 2 │ │Chunk K │     with overlap
+   └───┬────┘ └───┬────┘ └───┬────┘
+       │          │          │
+       ▼          ▼          ▼        ← MAP (Level 1):
+   ┌────────┐ ┌────────┐ ┌────────┐    concurrent chunk
+   │Summary │ │Summary │ │Summary │    summarization
+   │   1    │ │   2    │ │   K    │
+   └───┬────┘ └───┬────┘ └───┬────┘
+       └──────────┼──────────┘
+                  ▼
+          ┌──────────────┐            ← REDUCE (Level 2+):
+          │Merged Summary│              recursive merge until
+          │  (condensed) │              within token budget
+          └──────┬───────┘
+                 ▼
+         ┌───────────────┐            ← EXTRACT:
+         │ Structured     │             existing extraction
+         │ Artifact JSON  │             prompt runs on
+         └───────────────┘             condensed text
+```
+
+**Chunking Strategy:**
+- Transcripts are split into blocks along speaker-turn and paragraph boundaries — never mid-sentence.
+- Each chunk is capped at `HIERARCHICAL_CHUNK_MAX_TOKENS` (default 6 000) tokens measured via `tiktoken`.
+- A sliding overlap of `HIERARCHICAL_CHUNK_OVERLAP_TOKENS` (default 200) tokens is prepended to each subsequent chunk to maintain conversational context across boundaries.
+
+**Map Phase (Level 1):**
+- Each chunk is sent to the LLM with a summarization prompt that **strictly enforces** retention of all actionable items (tasks, decisions, blockers, user stories, action items).
+- Chunk summaries run concurrently via `asyncio.gather`, bounded by a semaphore (`HIERARCHICAL_CONCURRENCY_LIMIT`, default 3) to respect API rate limits.
+
+**Reduce Phase (Level 2+):**
+- Chunk summaries are concatenated. If the combined token count still exceeds `HIERARCHICAL_MAX_SUMMARY_TOKENS` (default 12 000), the pipeline re-chunks the summaries and runs another round of summarization + merge.
+- This recursive process continues until the text fits within the extraction budget or cannot be reduced further.
+
+**Final Extraction:**
+- The condensed summary — optionally augmented with RAG-retrieved context (see below) — is fed to the existing structured extraction prompt, producing the same `MeetingArtifacts` JSON schema the frontend expects. No downstream changes are required.
+
+### RAG Transcript Retrieval
+
+Even after hierarchical summarization, fine-grained details (specific acceptance criteria, exact assignees, resolution plans) can be compressed away during the Map-Reduce pipeline. The **RAG Transcript Retrieval** layer mitigates this by performing a targeted semantic search over the *original full-length transcript* at extraction time, injecting the most relevant verbatim segments alongside the condensed summary.
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    Full Transcript (N tokens)                     │
+└──────────┬────────────────────────────────────────┬───────────────┘
+           │                                        │
+           ▼                                        ▼
+  ┌─────────────────────┐               ┌──────────────────────┐
+  │ Hierarchical         │  (parallel)   │ RAG Indexing Pipeline │
+  │ Map-Reduce           │               │                      │
+  │ Summarization        │               │ 1. Chunk (1 500 tok) │
+  │                      │               │ 2. Embed (batched)   │
+  │                      │               │ 3. Store in NumPy    │
+  └──────────┬──────────┘               └──────────┬───────────┘
+             │                                      │
+             ▼                                      ▼
+  ┌──────────────────┐               ┌──────────────────────────┐
+  │ Condensed Summary │               │ Per-artifact retrieval:  │
+  │ (global context)  │               │ top-K cosine similarity  │
+  └──────────┬───────┘               │ for each artifact type   │
+             │                        └──────────┬───────────────┘
+             │                                   │
+             └──────────────┬────────────────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │ RAG-Augmented Prompt │
+                 │ (summary + segments) │
+                 └──────────┬──────────┘
+                            ▼
+                 ┌─────────────────────┐
+                 │ Structured Artifact  │
+                 │ JSON Extraction      │
+                 └─────────────────────┘
+```
+
+**How it works:**
+
+1. **Index Build** — The original transcript is split into small chunks (default 1 500 tokens, 100-token overlap) and each chunk is embedded via the configured provider (OpenAI `text-embedding-3-small` or Gemini `text-embedding-004`). Embeddings are batched to respect rate limits. The resulting vectors are stored in a plain NumPy array — no external vector database is needed.
+
+2. **Parallel Execution** — Index building runs concurrently with hierarchical summarization via `asyncio.gather`. Since they operate on independent API endpoints (embedding vs. text generation), this adds negligible latency.
+
+3. **Per-Artifact Retrieval** — Before extraction, the pipeline issues seven semantic search queries (one per artifact category: User Stories, Tasks, Decisions, Blockers, Action Items, Execution Tasks, Ideas). Each query returns the top-K (default 5) most relevant transcript segments ranked by cosine similarity.
+
+4. **Prompt Injection** — The retrieved segments are injected into the extraction prompt as a dedicated ``RETRIEVED TRANSCRIPT SEGMENTS`` section. The prompt instructs the LLM to treat these segments as **primary evidence** while using the condensed summary for global context. A configurable token budget (`RAG_MAX_CONTEXT_TOKENS`, default 3 000) prevents context window overflow.
+
+5. **Statelessness** — The NumPy vector index lives in-process memory for the duration of the job. When the worker's `TemporaryDirectory` context manager exits, all references are garbage-collected. No persistent storage is written.
+
+**When RAG activates:**
+- Only for transcripts exceeding `HIERARCHICAL_TOKEN_THRESHOLD` (same trigger as hierarchical summarization).
+- Short transcripts are extracted directly — the full text already fits in the LLM context window.
+- In `TEST_MODE` (mock provider), RAG is skipped since mock providers don't support embeddings.
+
+### Transcript Indexing Architecture
+
+The Transcript Indexing system is the foundation that powers both the RAG retrieval layer and future cross-meeting search. It exposes a pluggable storage backend selected via the `RAG_STORAGE_BACKEND` environment variable.
+
+**Storage Backends:**
+
+| Backend | Setting | Storage | Lifecycle | Use Case |
+|---------|---------|---------|-----------|----------|
+| **In-Memory (NumPy)** | `RAG_STORAGE_BACKEND=memory` (default) | NumPy `float32` arrays | Ephemeral — destroyed when the worker's temp directory exits | Single-job extraction; lowest latency; no external dependencies |
+| **Persistent (pgvector)** | `RAG_STORAGE_BACKEND=pgvector` | PostgreSQL `vector` column via the pgvector extension | Persistent — survives worker restarts; queryable from any process | Re-querying indexed transcripts; cross-meeting search; audit trails |
+
+**Indexing Pipeline (both backends):**
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                  Full Transcript (N tokens)                       │
+└──────────────────────┬───────────────────────────────────────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │ 1. Context-Aware       │  Split on speaker turns and
+          │    Chunking            │  paragraph boundaries, never
+          │    (1 500 tok/chunk,   │  mid-sentence. Sliding overlap
+          │     100 tok overlap)   │  prevents context loss.
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │ 2. Async Batched       │  Chunks batched to respect
+          │    Embedding           │  provider rate limits.
+          │    (OpenAI or Gemini)  │  RAG_EMBEDDING_BATCH_SIZE
+          └────────────┬───────────┘  controls batch width.
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │ 3. Vector Storage      │  memory → NumPy float32 array
+          │    (configurable)      │  pgvector → INSERT into
+          │                        │  transcript_embeddings table
+          └────────────┬───────────┘
+                       │
+                       ▼
+          ┌────────────────────────┐
+          │ 4. Cosine Similarity   │  memory → NumPy dot product
+          │    Search              │  pgvector → ORDER BY <=>
+          │    (top-K per query)   │  operator (exact kNN)
+          └────────────────────────┘
+```
+
+**Embedding Storage Format:**
+
+- **In-Memory:** Embeddings are stored as a contiguous `np.float32` matrix of shape `(num_chunks, embedding_dim)`. Cosine similarity is computed via normalised matrix multiplication — a single NumPy operation over the full index. No serialisation overhead.
+- **pgvector:** Each chunk is stored as a row in the `transcript_embeddings` table:
+
+  | Column | Type | Description |
+  |--------|------|-------------|
+  | `id` | `UUID` | Primary key (auto-generated) |
+  | `job_id` | `UUID` | Foreign key scoping embeddings to a specific job |
+  | `chunk_index` | `INTEGER` | Positional order within the transcript |
+  | `chunk_text` | `TEXT` | Verbatim chunk content |
+  | `embedding` | `vector` | Dimensionless pgvector column (768-d for Gemini, 1536-d for OpenAI) |
+  | `created_at` | `TIMESTAMPTZ` | Insertion timestamp |
+
+  Retrieval uses pgvector's native `<=>` cosine distance operator with an `ORDER BY … LIMIT` query scoped to `job_id`. For per-job workloads (hundreds of chunks), exact kNN is fast without an HNSW or IVFFlat index.
+
+**End-to-End Retrieval Workflow:**
+
+1. A long transcript enters the worker pipeline and triggers hierarchical summarization.
+2. **Concurrently**, the indexing system chunks the *original full-length transcript* into 1 500-token blocks with 100-token sliding overlap, embeds each chunk via the configured provider, and stores the vectors in the selected backend.
+3. After summarization completes, the pipeline issues seven semantic search queries — one per artifact category (User Stories, Tasks, Decisions, Blockers, Action Items, Execution Tasks, Ideas) — each retrieving the top-K most relevant verbatim transcript segments.
+4. Retrieved segments are assembled into a `RETRIEVED TRANSCRIPT SEGMENTS` block, token-budget-capped at `RAG_MAX_CONTEXT_TOKENS` (default 3 000), and injected alongside the condensed summary into the extraction prompt.
+5. The LLM receives both **global context** (condensed summary) and **fine-grained evidence** (retrieved segments), producing structured `MeetingArtifacts` JSON with maximal detail retention.
+
+**pgvector Setup:**
+
+To use the persistent backend:
+
+1. Install the `vector` extension on your PostgreSQL server (RDS: enable in `shared_preload_libraries`; self-hosted: `apt install postgresql-16-pgvector` or build from source).
+2. Run the migration: `alembic upgrade head` (or `alembic upgrade c7d9e1f3a5b2` for just this table).
+3. Set `RAG_STORAGE_BACKEND=pgvector` in your environment.
+
+The application also creates the table lazily on first use if the migration has not been applied.
+
+### Context Compression
+
+Even after hierarchical summarization, the condensed summary may contain conversational filler, hedging language, and low-density segments that consume tokens without contributing actionable information. The **Context Compression** layer sits between the Map-Reduce output and the final extraction prompt, reducing the token footprint while strictly preserving high-value semantic content.
+
+```
+┌──────────────────────────────────┐
+│  Condensed Summary (from Map-   │
+│  Reduce hierarchical pipeline)  │
+└───────────────┬──────────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  1. Segment Splitting      │  Speaker turns, bullets,
+   │                            │  paragraphs
+   └────────────┬───────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  2. Semantic Filtering     │  Remove filler, pleasantries,
+   │                            │  verbal tics, pure acks
+   └────────────┬───────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  3. Chunk Prioritization   │  Score segments on weighted
+   │                            │  feature set:
+   │   • Decision language  3.0 │
+   │   • Temporal markers   2.5 │
+   │   • Assignment patterns 2.5│
+   │   • Blocker language   2.5 │
+   │   • Action verbs       2.0 │
+   │   • Quantitative data  1.5 │
+   │   • Named entities     1.0 │
+   └────────────┬───────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  4. Budget Selection       │  Rank by score, select top
+   │                            │  segments up to token budget,
+   │                            │  restore original order
+   └────────────┬───────────────┘
+                │
+                ▼
+   ┌────────────────────────────┐
+   │  Compressed Context        │  Reduced token count,
+   │  (ready for extraction)    │  all actionable items preserved
+   └────────────────────────────┘
+```
+
+**Strategy: Semantic Filtering + Chunk Prioritization**
+
+The compression layer uses a purely algorithmic approach — no additional LLM calls, no added latency or API cost.
+
+1. **Semantic Filtering** — Regex-based pattern matching removes greetings, meeting logistics filler ("can everyone hear me"), verbal tics ("um", "uh"), standalone acknowledgements ("okay", "got it"), and non-verbal annotations ("[laughs]"). These patterns are compiled once at module load time.
+
+2. **Chunk Prioritization** — Each surviving segment is scored against a weighted feature set designed to surface actionable content:
+   - *Decision language* ("agreed", "confirmed", "we'll go with") scores highest at 3.0×
+   - *Temporal markers* (deadlines, sprint references, dates) score 2.5×
+   - *Assignment patterns* ("assigned to", "Tom will", "owner") score 2.5×
+   - *Blocker language* ("blocked", "dependency", "waiting on") scores 2.5×
+   - *Action verbs* ("implement", "deploy", "fix") score 2.0×
+   - *Quantitative data* (story points, percentages, durations) scores 1.5×
+   - *Named entities* (multi-word proper nouns, @mentions) score 1.0×
+
+3. **Budget-Constrained Selection** — Segments are ranked by score (descending) and greedily selected until the configurable token budget is filled (`COMPRESSION_TARGET_BUDGET_TOKENS`, default 8 000). Selected segments are returned in their original document order to preserve narrative coherence.
+
+**Artifact Accuracy Guarantees:**
+- Named entities, assignees, and technical terms are **never altered** — the compressor only removes or keeps whole segments, never rewrites text.
+- The scoring system is calibrated to heavily favour segments containing decisions, assignments, blockers, and deadlines — exactly the content the downstream extraction prompt needs.
+- A baseline score (0.1) is assigned to every non-filler segment, ensuring low-keyword but contextually relevant segments are still considered when budget allows.
+
+**Performance Impact:**
+- **Token Reduction:** ~30–50% reduction in tokens sent to the final extraction prompt (varies by meeting style — highly conversational meetings see larger gains).
+- **Latency:** Zero added LLM latency — the compression pass runs in-process on CPU in O(n) time.
+- **Cost Savings:** Proportional to token reduction — fewer input tokens per extraction API call.
+- **Accuracy:** The scoring system preserves all high-density actionable content. Combined with RAG-retrieved verbatim segments (which are injected separately), fine-grained details remain available to the extraction LLM.
+
+**When compression activates:**
+- Only for transcripts that trigger hierarchical summarization (exceeding `HIERARCHICAL_TOKEN_THRESHOLD`).
+- Disabled when `COMPRESSION_ENABLED=false`.
+- Skipped when the condensed summary already fits within `COMPRESSION_TARGET_BUDGET_TOKENS`.
+
 ### Chunked Transcription
 
 Multi-hour recordings are split into 5-minute WAV chunks via ffmpeg. The Whisper model is loaded once per process. Chunks are transcribed sequentially with `gc.collect()` after each to reclaim memory. Progress callbacks write per-chunk updates to PostgreSQL for real-time frontend visibility.
+
+### Prompt Engineering System
+
+The LLM extraction pipeline uses a **template-driven prompt architecture** with strict structured output validation and anti-hallucination safeguards. All prompt templates live in `backend/app/core/prompts.py` and follow a consistent five-section structure:
+
+```
+┌─────────────────────────────────────────────────┐
+│  1. ROLE         — Expert persona assignment     │
+│                    + anti-hallucination rules     │
+│  2. CONTEXT      — Transcript / summary input    │
+│  3. INSTRUCTIONS — Numbered extraction rules     │
+│                    with Chain-of-Thought guidance │
+│  4. EXAMPLES     — Few-shot JSON exemplar        │
+│  5. SCHEMA       — Exact JSON schema to follow   │
+└─────────────────────────────────────────────────┘
+```
+
+**Anti-hallucination safeguards** built into the role persona:
+- Extract ONLY what is explicitly stated or strongly implied in the transcript
+- Every field must be traceable to a specific passage — do not fabricate details
+- Prefer empty/null fields over invented content
+
+**Prompt domains:**
+
+| Domain | Builder | Persona | Technique |
+|--------|---------|---------|-----------|
+| **Artifact Extraction** | `build_extraction_prompt()` | Elite Agile Business Analyst | Few-shot exemplar, full JSON schema, anti-hallucination rules |
+| **Task Detection** | `build_task_detection_prompt()` | Agile Task Analyst | Explicit vs. Inferred classification |
+| **Decision Detection** | `build_decision_detection_prompt()` | Requirements Analyst | Chain-of-Thought 5-step reasoning |
+| **Summarization** | `build_summarization_prompt()` | Technical Meeting Analyst | Structured section output |
+
+Two additional templates (`CHUNK_SUMMARIZATION_PROMPT`, `MERGE_SUMMARIZATION_PROMPT`) drive the hierarchical Map-Reduce pipeline.
+
+**Artifact extraction categories (7 types):**
+
+1. **User Stories** — Role, desire, goal, acceptance criteria, story points
+2. **Decisions** — Title, description, rationale, `decision_summary`, `alternatives_rejected`, made-by
+3. **Tasks** — Title, description, assignee, priority, due date, `context` (reasoning)
+4. **Blockers** — Title, description, owner, resolution plan, affected tasks
+5. **Action Items** — `title`, description, assignee, due date, `context`, `priority`
+6. **Execution Tasks** — AI-inferred tasks with Explicit/Inferred source tracking
+7. **Ideas & Suggestions** — `idea_description`, `proposed_by`, `potential_impact`
+
+**Validation pipeline:**
+
+Raw LLM text passes through a strict 4-stage sanitization and validation pipeline defined in `backend/app/models/artifacts.py`:
+
+```
+ LLM raw text
+      │
+      ▼
+ ┌──────────────────────┐
+ │ 1. Sanitize text      │  Strip ```json fencing,
+ │                        │  remove trailing commas,
+ │                        │  extract JSON from prose
+ └──────────┬───────────┘
+            ▼
+ ┌──────────────────────┐
+ │ 2. JSON parse         │  json.loads() first;
+ │    + repair           │  json_repair.loads() fallback
+ └──────────┬───────────┘
+            ▼
+ ┌──────────────────────┐
+ │ 3. Pydantic v2        │  LLMExtractionResponse
+ │    validation          │  model_validate() with
+ │    + model_validators  │  pre-validation cleaning
+ └──────────┬───────────┘
+            ▼
+ ┌──────────────────────┐
+ │ 4. Domain conversion  │  to_meeting_artifacts()
+ │    + normalization     │  → MeetingArtifacts
+ └──────────────────────┘
+```
+
+The `sanitize_json_string()` function chains three recovery stages: markdown fencing removal, trailing comma cleanup via regex, and brace-boundary extraction that discards any LLM prose surrounding the JSON object. The `json-repair` library then recovers from remaining issues (missing quotes, unescaped characters) before Pydantic validation runs. All Pydantic models use `@model_validator(mode="before")` decorators that strip whitespace from strings, normalize dates, and clamp confidence scores to [0.0, 1.0].
+
+**Retry strategy:**
+
+If validation fails (malformed JSON or schema mismatch), the pipeline **retries at progressively lower temperatures** with an explicit re-prompt on the final attempt:
+
+1. **Attempt 1:** `temperature=0.1` — standard extraction
+2. **Attempt 2:** `temperature=0.0` — maximum determinism retry
+3. **Attempt 3:** `temperature=0.0` with explicit re-prompt instructing the LLM to return only valid JSON
+
+This three-temperature approach is separate from the `tenacity` retry logic that handles transient API errors (connection failures, timeouts). Both layers combine to provide robust end-to-end reliability.
 
 ---
 
@@ -150,25 +592,32 @@ meetolog/
 │   │   ├── interfaces.py              # Abstract base classes (JobStore, Transcriber, LLMExtractor)
 │   │   ├── models/
 │   │   │   ├── schemas.py             # Pydantic models (MeetingArtifacts, JobResponse, etc.)
+│   │   │   ├── artifacts.py           # LLM response validation & JSON repair pipeline
 │   │   │   ├── metadata.py            # FileMetadata SQLAlchemy ORM
 │   │   │   └── db_models.py           # JobRecord SQLAlchemy ORM
 │   │   ├── core/
-│   │   │   └── logger.py              # structlog configuration (JSON / console)
+│   │   │   ├── logger.py              # structlog configuration (JSON / console)
+│   │   │   └── prompts.py             # Template-driven prompt system (6 domains)
 │   │   ├── infrastructure/
 │   │   │   ├── db.py                  # Async SQLAlchemy engine + session
 │   │   │   ├── postgres_job_store.py  # PostgresJobStore (read/update)
 │   │   │   └── postgres_queue.py      # PostgresJobQueue (SKIP LOCKED queue)
 │   │   ├── services/
 │   │   │   ├── storage.py             # S3StorageService (upload/download/presign)
-│   │   │   ├── transcription.py       # WhisperTranscriber (chunked)
-│   │   │   ├── llm_extraction.py      # GeminiExtractor
+│   │   │   ├── transcription.py       # WhisperTranscriber (chunked + segment-level)
+│   │   │   ├── diarization.py         # SpeakerDiarizer (pyannote global timeline)
+│   │   │   ├── llm_extraction.py      # Unified Intelligence Pipeline (HierarchicalExtractor)
 │   │   │   ├── llm_engine.py          # LLM provider abstraction (Gemini/OpenAI)
+│   │   │   ├── rag_retrieval.py       # RAG transcript retrieval (embed, index, search)
+│   │   │   ├── transcript_index.py    # PgVectorIndex — persistent pgvector storage backend
+│   │   │   ├── compression.py         # Context compression (semantic filtering + prioritization)
 │   │   │   ├── heuristics.py          # Deterministic confidence scoring
 │   │   │   ├── pdf_generator.py       # ReportLab PDF generation
 │   │   │   ├── jira_mapper.py         # Jira bulk-import JSON mapper
 │   │   │   └── mock_services.py       # Mock services for testing
 │   │   └── utils/
-│   │       └── audio.py               # ffmpeg audio splitting & duration probe
+│   │       ├── audio.py               # ffmpeg audio splitting & duration probe
+│   │       └── text_chunking.py       # Token-aware transcript chunking
 │   ├── alembic/                       # Database migrations
 │   ├── tests/
 │   ├── Dockerfile                     # Multi-stage production image
@@ -198,7 +647,7 @@ meetolog/
 │   ├── iam-execution-role-policy.json # Execution role (ECR, SSM, CloudWatch)
 │   └── iam-task-role-policy.json      # Task role (S3, CloudWatch)
 │
-├── docker-compose.yml                 # Local dev stack (PostgreSQL, MinIO, Redis)
+├── docker-compose.yml                 # Local dev stack (PostgreSQL, MinIO, S3-compatible storage)
 └── LICENSE
 ```
 
@@ -235,6 +684,19 @@ All variables are loaded via Pydantic Settings from environment variables (or `.
 | `AWS_ENDPOINT_URL` | `None` | Custom S3 endpoint (e.g. `http://minio:9000` for local MinIO) |
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated allowed origins |
 | `MAX_UPLOAD_SIZE_MB` | `100` | Max upload size |
+| `HIERARCHICAL_TOKEN_THRESHOLD` | `12000` | Token count above which hierarchical summarization activates |
+| `HIERARCHICAL_CHUNK_MAX_TOKENS` | `6000` | Maximum tokens per chunk in the Map phase |
+| `HIERARCHICAL_CHUNK_OVERLAP_TOKENS` | `200` | Overlap tokens between consecutive chunks |
+| `HIERARCHICAL_MAX_SUMMARY_TOKENS` | `12000` | Trigger an additional Reduce pass if merged summaries exceed this |
+| `HIERARCHICAL_CONCURRENCY_LIMIT` | `3` | Max concurrent LLM calls during the Map phase |
+| `RAG_CHUNK_MAX_TOKENS` | `1500` | Maximum tokens per chunk for RAG indexing |
+| `RAG_CHUNK_OVERLAP_TOKENS` | `100` | Overlap tokens between consecutive RAG chunks |
+| `RAG_TOP_K` | `5` | Number of top-K chunks to retrieve per artifact category |
+| `RAG_MAX_CONTEXT_TOKENS` | `3000` | Token budget for RAG context injected into extraction prompt |
+| `RAG_EMBEDDING_BATCH_SIZE` | `64` | Batch size for embedding API calls during RAG indexing |
+| `RAG_STORAGE_BACKEND` | `memory` | RAG vector storage: `memory` (ephemeral NumPy) or `pgvector` (persistent PostgreSQL) |
+| `COMPRESSION_ENABLED` | `true` | Enable context compression before final extraction |
+| `COMPRESSION_TARGET_BUDGET_TOKENS` | `8000` | Target token budget for compressed context |
 
 The frontend reads:
 

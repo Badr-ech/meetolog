@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "WhisperTranscriber",
     "ProgressCallback",
+    "TranscriptSegment",
     "_get_cached_model",
 ]
 
@@ -43,6 +45,18 @@ _whisper = None
 # Singleton model cache: keeps the loaded model in memory across jobs
 # so we don't reload from disk (~2-3s) on every transcription request
 _model_cache: dict[str, object] = {}
+
+
+@dataclass(slots=True)
+class TranscriptSegment:
+    """A single timestamped span of transcribed text.
+
+    Timestamps are in seconds relative to the *full* recording (global
+    timeline), not the chunk that produced the segment.
+    """
+    start: float
+    end: float
+    text: str
 
 
 def _get_whisper():
@@ -109,6 +123,27 @@ class WhisperTranscriber(Transcriber):
         logger.info(f"Transcription complete. Detected language: {detected_language}")
 
         return transcript
+
+    def _transcribe_segments_sync(self, audio_path: Path) -> list[TranscriptSegment]:
+        """Transcribe and return timestamped segments (blocking)."""
+        model = self._load_model()
+
+        result = model.transcribe(
+            str(audio_path),
+            language=None,
+            verbose=False,
+        )
+
+        segments: list[TranscriptSegment] = []
+        for seg in result.get("segments", []):
+            text = seg.get("text", "").strip()
+            if text:
+                segments.append(TranscriptSegment(
+                    start=seg["start"],
+                    end=seg["end"],
+                    text=text,
+                ))
+        return segments
 
     # ------------------------------------------------------------------
     # Public API
@@ -219,6 +254,97 @@ class WhisperTranscriber(Transcriber):
             raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
         text = await asyncio.to_thread(self._transcribe_sync, chunk_path)
         return self._clean_text(text)
+
+    async def transcribe_with_segments(
+        self,
+        audio_path: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> tuple[str, list[TranscriptSegment]]:
+        """Transcribe audio and return both text and globally-timestamped segments.
+
+        Identical to :meth:`transcribe` in chunking strategy, but each
+        chunk's Whisper segments are collected with their timestamps
+        offset to the global recording timeline.  This data is required
+        by the diarization alignment step.
+
+        Returns
+        -------
+        tuple[str, list[TranscriptSegment]]
+            *(full_transcript, segments)* — the concatenated text plus
+            a chronological list of timestamped segments.
+        """
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        self._load_model()
+        chunk_dir = Path(tempfile.mkdtemp(prefix="meetolog_chunks_"))
+
+        try:
+            chunks = await asyncio.to_thread(
+                split_audio_into_chunks,
+                audio_path,
+                chunk_dir,
+                self._chunk_duration_sec,
+            )
+            total_chunks = len(chunks)
+
+            logger.info(
+                "Starting segment-level transcription: %d chunk(s), model=%s",
+                total_chunks, self._model_name,
+            )
+
+            all_segments: list[TranscriptSegment] = []
+            transcripts: list[str] = []
+
+            for i, chunk_path in enumerate(chunks):
+                chunk_offset = i * self._chunk_duration_sec
+
+                chunk_segments = await asyncio.to_thread(
+                    self._transcribe_segments_sync, chunk_path,
+                )
+
+                for seg in chunk_segments:
+                    seg.start += chunk_offset
+                    seg.end += chunk_offset
+                    all_segments.append(seg)
+                    transcripts.append(self._clean_text(seg.text))
+
+                try:
+                    os.remove(chunk_path)
+                except OSError:
+                    pass
+
+                logger.info(
+                    "Chunk %d/%d transcribed (%d segments)",
+                    i + 1, total_chunks, len(chunk_segments),
+                )
+
+                if progress_callback is not None:
+                    await progress_callback(i, total_chunks)
+
+                del chunk_segments
+                gc.collect()
+
+            full_transcript = " ".join(t for t in transcripts if t)
+
+            if not full_transcript.strip():
+                raise RuntimeError("Transcription returned empty result")
+
+            logger.info(
+                "Segment transcription complete: %d chunks, %d segments, %d chars",
+                total_chunks, len(all_segments), len(full_transcript),
+            )
+            return full_transcript, all_segments
+
+        except (AudioSplitError, RuntimeError):
+            raise
+
+        except Exception as exc:
+            logger.error("Segment transcription failed: %s", exc)
+            raise RuntimeError(f"Failed to transcribe audio: {exc}") from exc
+
+        finally:
+            shutil.rmtree(chunk_dir, ignore_errors=True)
 
     async def preprocess_transcript(self, raw_transcript: str) -> str:
         return self._clean_text(raw_transcript)

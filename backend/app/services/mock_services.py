@@ -20,6 +20,7 @@ from ..models import (
     Decision,
     Blocker,
     ActionItem,
+    Idea,
     Priority,
     TaskStatus,
 )
@@ -140,6 +141,11 @@ class MockExtractor(LLMExtractor):
         """This is a mock implementation."""
         return True
     
+    async def generate_text(self, prompt: str) -> str:
+        """Return a truncated echo of the prompt for testing."""
+        await asyncio.sleep(self._delay)
+        return f"Mock summary of input text ({len(prompt)} chars)."
+
     async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
         """
         Return deterministic mock artifacts matching the MeetingArtifacts schema.
@@ -268,6 +274,14 @@ class MockExtractor(LLMExtractor):
                     description="Document acceptance criteria for password validation",
                     assignee="Sarah",
                     due_date=None,
+                ),
+            ],
+            ideas=[
+                Idea(
+                    id=uuid4(),
+                    idea_description="Implement OAuth2 social login as a follow-up to the email/password flow",
+                    proposed_by="Lisa",
+                    potential_impact="Could increase sign-up conversion by reducing friction for new users",
                 ),
             ],
             execution_tasks=[

@@ -9,6 +9,7 @@
 /** All valid backend processing states. */
 export type JobStatus =
   | "uploading"
+  | "diarizing"
   | "transcribing"
   | "extracting"
   | "generating_pdf"
@@ -30,6 +31,7 @@ export interface StageInfo {
  */
 export const PROGRESS_MAPPING: Record<string, StageInfo> = {
   uploading: { label: "Uploading Audio…", pct: 10 },
+  diarizing: { label: "Identifying Speakers…", pct: 15 },
   transcribing: { label: "Transcribing Audio…", pct: 25 },
   extracting: { label: "Extracting Artifacts…", pct: 50 },
   generating_pdf: { label: "Generating PDF…", pct: 75 },

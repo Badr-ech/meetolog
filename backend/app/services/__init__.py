@@ -7,7 +7,6 @@ dependencies (reportlab, whisper) are not installed.
 
 # Always available (no external deps)
 from .mock_services import MockTranscriber, MockExtractor
-from .job_store import LocalJobStore
 
 
 def __getattr__(name: str):
@@ -15,9 +14,9 @@ def __getattr__(name: str):
     if name == "WhisperTranscriber":
         from .transcription import WhisperTranscriber
         return WhisperTranscriber
-    elif name == "GeminiExtractor":
-        from .llm_extraction import GeminiExtractor
-        return GeminiExtractor
+    elif name == "HierarchicalExtractor":
+        from .llm_extraction import HierarchicalExtractor
+        return HierarchicalExtractor
     elif name == "PDFGeneratorService":
         from .pdf_generator import PDFGeneratorService
         return PDFGeneratorService
@@ -33,18 +32,21 @@ def __getattr__(name: str):
     elif name == "get_llm_provider":
         from .llm_engine import get_llm_provider
         return get_llm_provider
+    elif name == "ContextCompressor":
+        from .compression import ContextCompressor
+        return ContextCompressor
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "WhisperTranscriber",
-    "GeminiExtractor",
+    "HierarchicalExtractor",
     "PDFGeneratorService",
-    "LocalJobStore",
     "MockTranscriber",
     "MockExtractor",
     "LLMProvider",
     "GeminiProvider",
     "OpenAIProvider",
     "get_llm_provider",
+    "ContextCompressor",
 ]

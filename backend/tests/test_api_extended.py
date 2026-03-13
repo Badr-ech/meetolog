@@ -2,15 +2,16 @@
 GET /download edge cases, upload size rejection, and schema validation (422)."""
 
 from io import BytesIO
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import Row
 
-from app.main import app, get_job_store
+from app.main import app, get_job_store, get_job_queue, get_s3_service
+from app.infrastructure.db import get_async_session
 from app.models import (
     JobResponse,
     MeetingArtifacts,
@@ -24,6 +25,7 @@ from app.models import (
     Priority,
     TaskStatus,
 )
+from app.models.db_models import JobRecord
 
 SAMPLE_JOB_ID = UUID("12345678-1234-5678-1234-567812345678")
 
@@ -92,31 +94,43 @@ def mock_job_store():
 
 
 @pytest.fixture
-def mock_arq_pool():
-    pool = AsyncMock()
-    arq_job = MagicMock()
-    arq_job.job_id = str(SAMPLE_JOB_ID)
-    pool.enqueue_job = AsyncMock(return_value=arq_job)
-    pool.close = AsyncMock()
-    return pool
+def mock_job_queue():
+    queue = AsyncMock()
+    record = MagicMock(spec=JobRecord)
+    record.id = SAMPLE_JOB_ID
+    record.message = "Job queued"
+    record.progress = 0
+    queue.enqueue_job = AsyncMock(return_value=record)
+    return queue
+
+
+@pytest.fixture
+def mock_s3_service():
+    s3 = AsyncMock()
+    s3.upload_stream = AsyncMock()
+    s3.generate_presigned_get_url = AsyncMock(return_value="https://s3.example.com/test.pdf")
+    return s3
+
+
+@pytest.fixture
+def mock_db_session():
+    session = AsyncMock()
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    # Default: no pdf_s3_key found for download endpoint
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    session.execute = AsyncMock(return_value=mock_result)
+    return session
 
 
 @pytest_asyncio.fixture
-async def client(mock_job_store, mock_arq_pool):
+async def client(mock_job_store, mock_job_queue, mock_s3_service, mock_db_session):
     app.dependency_overrides[get_job_store] = lambda: mock_job_store
+    app.dependency_overrides[get_job_queue] = lambda: mock_job_queue
+    app.dependency_overrides[get_async_session] = lambda: mock_db_session
 
-    with (
-        patch(
-            "app.main.check_redis_health",
-            new_callable=AsyncMock,
-            return_value={"status": "healthy"},
-        ),
-        patch(
-            "app.main.get_arq_pool",
-            new_callable=AsyncMock,
-            return_value=mock_arq_pool,
-        ),
-    ):
+    with patch("app.main.get_s3_service", return_value=mock_s3_service):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             yield ac
@@ -234,20 +248,24 @@ async def test_jira_export_404_when_no_artifacts(client, mock_job_store):
 # GET /health
 
 @pytest.mark.asyncio
-async def test_health_endpoint(client):
-    with patch("app.main.get_redis_pool", new_callable=AsyncMock) as mock_redis:
-        mock_redis_client = AsyncMock()
-        mock_redis_client.llen = AsyncMock(return_value=2)
-        mock_redis.return_value = mock_redis_client
+async def test_health_endpoint(client, mock_db_session):
+    """Health endpoint reports database status and job counts."""
+    # Mock the DB query result for pending/processing counts
+    mock_row = MagicMock()
+    mock_row.pending = 2
+    mock_row.processing = 1
+    mock_result = MagicMock()
+    mock_result.one.return_value = mock_row
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
 
-        response = await client.get("/health")
-        assert response.status_code == 200
-        body = response.json()
-        assert "status" in body
-        assert "components" in body
+    response = await client.get("/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert "status" in body
+    assert "components" in body
 
 
-# GET /download/{job_id} â€” edge cases
+# GET /download/{job_id} — edge cases
 
 @pytest.mark.asyncio
 async def test_download_returns_404_for_missing_job(client, mock_job_store):
@@ -257,19 +275,22 @@ async def test_download_returns_404_for_missing_job(client, mock_job_store):
 
 
 @pytest.mark.asyncio
-async def test_download_returns_404_when_pdf_missing_on_disk(
-    client, mock_job_store, tmp_path
+async def test_download_returns_404_when_pdf_not_on_s3(
+    client, mock_job_store, mock_db_session
 ):
-    """Job is complete but the PDF file was cleaned up."""
+    """Job is complete but no PDF S3 key exists."""
     mock_job_store.load.return_value = _completed_job()
 
-    with patch("app.main.settings") as mock_settings:
-        mock_settings.output_dir = str(tmp_path)
-        response = await client.get(f"/download/{SAMPLE_JOB_ID}")
-        assert response.status_code == 404
+    # DB returns no pdf_s3_key
+    mock_result = MagicMock()
+    mock_result.scalar_one_or_none.return_value = None
+    mock_db_session.execute = AsyncMock(return_value=mock_result)
+
+    response = await client.get(f"/download/{SAMPLE_JOB_ID}")
+    assert response.status_code == 404
 
 
-# POST /upload â€” size rejection
+# POST /upload — size rejection
 
 @pytest.mark.asyncio
 async def test_upload_rejects_oversized_file(client):
@@ -286,7 +307,7 @@ async def test_upload_rejects_oversized_file(client):
         assert "too large" in response.json()["detail"].lower()
 
 
-# GET /artifacts/{job_id} â€” cache fallback
+# GET /artifacts/{job_id} — cache fallback
 
 @pytest.mark.asyncio
 async def test_get_artifacts_uses_cache_when_job_has_none(

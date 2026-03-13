@@ -21,6 +21,47 @@ class AudioSplitError(RuntimeError):
     """Raised when ffmpeg fails to split an audio file into chunks."""
 
 
+def convert_to_mono_wav(audio_path: Path, output_path: Path) -> Path:
+    """Convert any audio file to 16 kHz mono WAV using ffmpeg.
+
+    Produces the waveform format expected by both Whisper and the
+    pyannote speaker-diarization pipeline.  Writing to disk avoids
+    holding the decoded waveform in Python memory.
+
+    Args:
+        audio_path: Source audio file (any format ffmpeg supports).
+        output_path: Destination path for the 16 kHz mono WAV.
+
+    Returns:
+        *output_path* (for convenience in chaining).
+
+    Raises:
+        AudioSplitError: If ffmpeg exits with a non-zero code or times out.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(audio_path),
+        "-ar", "16000",
+        "-ac", "1",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        raise AudioSplitError(
+            f"ffmpeg timed out converting {audio_path.name}"
+        ) from exc
+
+    if result.returncode != 0:
+        stderr_snippet = (result.stderr or "")[:500]
+        raise AudioSplitError(
+            f"ffmpeg mono conversion failed (rc={result.returncode}): {stderr_snippet}"
+        )
+
+    return output_path
+
+
 def get_audio_duration(audio_path: Path) -> float:
     """Return audio duration in seconds using ``ffprobe``.
 

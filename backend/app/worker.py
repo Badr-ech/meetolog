@@ -9,6 +9,7 @@ horizontal scaling across multiple replicas.
 """
 
 import asyncio
+import gc
 import os
 import signal
 import sys
@@ -58,7 +59,9 @@ def _get_transcriber():
 
 def _get_llm_provider():
     from app.services.llm_engine import get_llm_provider as _get_provider
-    return _get_provider()
+    from app.services.llm_extraction import HierarchicalExtractor
+    provider = _get_provider()
+    return HierarchicalExtractor(provider)
 
 
 def _get_pdf_service(output_dir: Path):
@@ -109,34 +112,103 @@ async def process_job(
             job_logger.info("s3_download_start", s3_key=s3_key)
             await s3_service.download_to_file(s3_key, str(audio_path))
 
+            # --- Stage 0 (optional): Speaker Diarization ---
+            settings = get_settings()
+            diarization_enabled = bool(settings.hf_token) and not settings.test_mode
+            diarization_timeline = None
+
+            if diarization_enabled:
+                await queue.update_job_progress(
+                    job_id,
+                    status=ProcessingStatus.DIARIZING.value,
+                    progress=5,
+                    message="Identifying speakers…",
+                )
+
+                from app.services.diarization import SpeakerDiarizer
+                from app.utils.audio import convert_to_mono_wav
+
+                mono_wav_path = work_path / f"{job_id}_mono.wav"
+                job_logger.info("converting_mono_wav")
+                await asyncio.to_thread(convert_to_mono_wav, audio_path, mono_wav_path)
+
+                diarizer = SpeakerDiarizer(settings.hf_token)
+                diarization_timeline = await diarizer.diarize(mono_wav_path)
+
+                # Free diarization resources before Whisper loads
+                del diarizer
+                mono_wav_path.unlink(missing_ok=True)
+                gc.collect()
+
+                await queue.update_job_progress(
+                    job_id,
+                    progress=18,
+                    message=f"Speaker analysis complete — {len(set(s.speaker for s in diarization_timeline))} speakers detected",
+                )
+                job_logger.info(
+                    "diarization_complete",
+                    num_turns=len(diarization_timeline),
+                    num_speakers=len(set(s.speaker for s in diarization_timeline)),
+                )
+
             # --- Stage 1: Transcription ---
             await queue.update_job_progress(
                 job_id,
                 status=ProcessingStatus.TRANSCRIBING.value,
-                progress=25,
+                progress=20 if diarization_enabled else 25,
                 message="Transcribing audio...",
             )
 
             transcriber = _get_transcriber()
 
-            async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
-                pct = 25 + int(23 * ((chunk_idx + 1) / total))
-                job_logger.info(
-                    "transcription_progress",
-                    chunk=chunk_idx + 1,
-                    total_chunks=total,
-                    progress_pct=pct,
-                )
-                await queue.update_job_progress(
-                    job_id,
-                    progress=pct,
-                    message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
+            if diarization_enabled and diarization_timeline is not None:
+                # Transcribe with segment timestamps for speaker alignment
+                base_pct = 20
+                span_pct = 25
+
+                async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
+                    pct = base_pct + int(span_pct * ((chunk_idx + 1) / total))
+                    job_logger.info(
+                        "transcription_progress",
+                        chunk=chunk_idx + 1,
+                        total_chunks=total,
+                        progress_pct=pct,
+                    )
+                    await queue.update_job_progress(
+                        job_id,
+                        progress=pct,
+                        message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
+                    )
+
+                _, segments = await transcriber.transcribe_with_segments(
+                    audio_path,
+                    progress_callback=_on_transcription_progress,
                 )
 
-            transcript = await transcriber.transcribe(
-                audio_path,
-                progress_callback=_on_transcription_progress,
-            )
+                from app.services.diarization import SpeakerDiarizer as _SD
+                transcript = _SD.assign_speakers(segments, diarization_timeline)
+                del segments, diarization_timeline
+                gc.collect()
+            else:
+                # Original path — plain text transcription
+                async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
+                    pct = 25 + int(23 * ((chunk_idx + 1) / total))
+                    job_logger.info(
+                        "transcription_progress",
+                        chunk=chunk_idx + 1,
+                        total_chunks=total,
+                        progress_pct=pct,
+                    )
+                    await queue.update_job_progress(
+                        job_id,
+                        progress=pct,
+                        message=f"Transcribing chunk {chunk_idx + 1}/{total}...",
+                    )
+
+                transcript = await transcriber.transcribe(
+                    audio_path,
+                    progress_callback=_on_transcription_progress,
+                )
 
             await queue.update_job_progress(
                 job_id, progress=48, message="Transcription complete",
@@ -153,7 +225,23 @@ async def process_job(
             )
 
             llm_provider = _get_llm_provider()
-            artifacts: MeetingArtifacts = await llm_provider.extract_artifacts(transcript)
+
+            # Granular progress callback — the pipeline invokes this
+            # at each stage so the user sees real-time updates.
+            _STAGE_PCT = {
+                "summarizing": 52,
+                "compressing": 60,
+                "retrieving": 63,
+                "extracting": 66,
+            }
+
+            async def _on_extraction_stage(stage: str, detail: str) -> None:
+                pct = _STAGE_PCT.get(stage, 50)
+                await queue.update_job_progress(job_id, progress=pct, message=detail)
+
+            artifacts: MeetingArtifacts = await llm_provider.extract_artifacts(
+                transcript, job_id=job_id, on_stage=_on_extraction_stage,
+            )
 
             from app.services.heuristics import backfill_confidence_scores
             backfill_confidence_scores(artifacts)
@@ -163,6 +251,10 @@ async def process_job(
             )
             extraction_time = time.monotonic() - start_time - transcription_time
             job_logger.info("extraction_complete", duration_seconds=round(extraction_time, 2))
+
+            # Free extraction objects before PDF generation.
+            del llm_provider
+            gc.collect()
 
             # --- Stage 3: PDF Generation (into temp dir) ---
             await queue.update_job_progress(

@@ -202,9 +202,20 @@ class PDFGeneratorService:
                 conf = _fmt_confidence(d.confidence_score)
                 story.append(Paragraph(f"• {d.title}  (Confidence: {conf})", self.styles['ItemTitle']))
                 story.append(Paragraph(d.description, self.styles['ItemDetail']))
+                if d.decision_summary:
+                    story.append(Paragraph(
+                        f"<b>Summary:</b> {d.decision_summary}",
+                        self.styles['ItemDetail']
+                    ))
                 if d.rationale:
                     story.append(Paragraph(
                         f"<i>Rationale: {d.rationale}</i>",
+                        self.styles['ItemDetail']
+                    ))
+                if d.alternatives_rejected:
+                    alts = ", ".join(d.alternatives_rejected)
+                    story.append(Paragraph(
+                        f"<i>Rejected alternatives: {alts}</i>",
                         self.styles['ItemDetail']
                     ))
                 story.append(Spacer(1, 8))
@@ -240,6 +251,23 @@ class PDFGeneratorService:
                 ))
             story.append(Spacer(1, 12))
         
+        # Ideas
+        if artifacts.ideas:
+            story.append(Paragraph("Ideas &amp; Suggestions", self.styles['SectionTitle']))
+            for idea in artifacts.ideas:
+                conf = _fmt_confidence(idea.confidence_score)
+                proposed = f" (proposed by {idea.proposed_by})" if idea.proposed_by else ""
+                story.append(Paragraph(
+                    f"• {idea.idea_description}{proposed} | Confidence: {conf}",
+                    self.styles['Normal']
+                ))
+                if idea.potential_impact:
+                    story.append(Paragraph(
+                        f"<i>Impact: {idea.potential_impact}</i>",
+                        self.styles['ItemDetail']
+                    ))
+            story.append(Spacer(1, 12))
+
         # Execution Tasks (appended last, on a new page)
         if artifacts.execution_tasks:
             story.append(PageBreak())
