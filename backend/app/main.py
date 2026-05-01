@@ -1,12 +1,9 @@
-"""
-Meetolog Backend — FastAPI application entry point.
+"""FastAPI application entry point for the Meetolog backend.
 
-Defines all HTTP endpoints for audio upload, job status polling,
-artifact retrieval/editing, PDF download, and Jira export.
+Exposes endpoints for audio upload (direct or presigned), job status
+polling, artifact retrieval/editing, PDF download, and Jira export.
 """
 
-import logging
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -20,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
+from .core.logger import configure_logging, get_logger
 from .models import JobResponse, ProcessingStatus, MeetingArtifacts
 from .models.metadata import FileMetadata
 from .models.db_models import JobRecord
@@ -29,23 +27,18 @@ from .infrastructure.postgres_queue import PostgresJobQueue
 from .services.jira_mapper import map_artifacts_to_jira
 from .services.storage import S3StorageService
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logger = logging.getLogger(__name__)
-
-# Initialize settings
 settings = get_settings()
+configure_logging(json_output=not settings.debug, log_level="INFO")
+logger = get_logger(component="api")
 
-# S3 storage service (singleton)
+# Presigned-GET URL for the generated PDF is valid for one hour.
+_PDF_DOWNLOAD_URL_TTL_SECONDS = 3600
+
 _s3_service: S3StorageService | None = None
 
 
 def get_s3_service() -> S3StorageService:
-    """Return the global S3StorageService, creating it on first call."""
+    """Return the process-wide S3StorageService, creating it on first call."""
     global _s3_service
     if _s3_service is None:
         _s3_service = S3StorageService()
@@ -64,7 +57,6 @@ async def get_job_queue(
     return PostgresJobQueue(session)
 
 
-# Type aliases for cleaner endpoint signatures
 JobStoreDep = Annotated[PostgresJobStore, Depends(get_job_store)]
 JobQueueDep = Annotated[PostgresJobQueue, Depends(get_job_queue)]
 DBSessionDep = Annotated[AsyncSession, Depends(get_async_session)]
@@ -72,33 +64,32 @@ DBSessionDep = Annotated[AsyncSession, Depends(get_async_session)]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    logger.info("Starting Meetolog API...")
+    logger.info("api_starting")
 
-    # Initialize PostgreSQL and create tables
     if settings.database_url:
         try:
             await init_db()
-            logger.info("PostgreSQL database initialised")
-        except Exception as e:
-            logger.error(f"Failed to initialise database: {e}")
-            logger.warning("API starting without PostgreSQL")
+            logger.info("database_initialised")
+        except Exception as exc:
+            logger.error("database_init_failed", error=str(exc))
+            logger.warning("api_starting_without_database")
     else:
-        logger.warning("DATABASE_URL not set — job persistence unavailable")
+        logger.warning("database_url_not_set")
 
-    logger.info(f"S3 bucket: {settings.aws_s3_bucket or '(not configured)'}")
-    logger.info(f"LLM Provider: {settings.llm_provider}")
-    logger.info(f"Test Mode: {settings.test_mode}")
+    logger.info(
+        "api_ready",
+        s3_bucket=settings.aws_s3_bucket or "(not configured)",
+        llm_provider=settings.llm_provider,
+        test_mode=settings.test_mode,
+    )
 
     yield
 
-    # Shutdown
-    logger.info("Shutting down Meetolog API...")
+    logger.info("api_shutting_down")
     await close_db()
-    logger.info("Shutdown complete")
+    logger.info("api_shutdown_complete")
 
 
-# Initialize FastAPI app with lifespan
 app = FastAPI(
     title="Meetolog API",
     description="Transform meeting recordings into structured Agile artifacts",
@@ -106,9 +97,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS for frontend access
-allowed_origins = [origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()]
-logger.info(f"CORS allowed origins: {allowed_origins}")
+allowed_origins = [
+    origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()
+]
+logger.info("cors_configured", allowed_origins=allowed_origins)
 
 app.add_middleware(
     CORSMiddleware,
@@ -120,7 +112,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Request / response schemas for the presigned upload flow
+# Request / response schemas
 # ---------------------------------------------------------------------------
 
 
@@ -190,7 +182,7 @@ async def presign_upload(body: PresignRequest):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        logger.error("Presign generation failed: %s", exc)
+        logger.error("presign_generation_failed", error=str(exc))
         raise HTTPException(
             status_code=503,
             detail="Failed to generate upload URL. Please try again later.",
@@ -222,25 +214,22 @@ async def enqueue_job(
     safe_file_name = Path(body.file_name).name
     job_id = uuid4()
 
-    # Persist file metadata in PostgreSQL
     if settings.database_url:
-        metadata_record = FileMetadata(
+        db.add(FileMetadata(
             job_id=str(job_id),
             s3_key=body.s3_key,
             original_filename=safe_file_name,
             file_size_bytes=body.file_size,
-        )
-        db.add(metadata_record)
+        ))
         await db.commit()
 
-    # Insert job into the persistent Postgres queue
     record = await queue.enqueue_job(
         job_id=job_id,
         s3_key=body.s3_key,
         file_name=safe_file_name,
         file_size=body.file_size,
     )
-    logger.info("Job %s enqueued to Postgres queue", job_id)
+    logger.info("job_enqueued", job_id=str(job_id), source="presigned_upload")
 
     return JobResponse(
         job_id=record.id,
@@ -262,7 +251,6 @@ async def upload_audio(
     Streams the file directly to S3 (no local storage), persists
     metadata in PostgreSQL, and inserts a job into the Postgres queue.
     """
-    # Validate file type
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
 
@@ -270,57 +258,60 @@ async def upload_audio(
     if file_ext not in settings.allowed_audio_extensions:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type: {file_ext}. "
-                   f"Allowed: {settings.allowed_audio_extensions}",
+            detail=(
+                f"Unsupported file type: {file_ext}. "
+                f"Allowed: {settings.allowed_audio_extensions}"
+            ),
         )
 
-    # Validate file size
-    file.file.seek(0, 2)  # Seek to end
+    # Determine the file size from the stream without buffering it in memory.
+    file.file.seek(0, 2)
     file_size = file.file.tell()
+    file.file.seek(0)
     size_mb = file_size / (1024 * 1024)
-    file.file.seek(0)  # Reset
 
     if size_mb > settings.max_upload_size_mb:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large: {size_mb:.1f}MB. Max: {settings.max_upload_size_mb}MB",
+            detail=f"File too large: {size_mb:.1f} MB. Max: {settings.max_upload_size_mb} MB",
         )
 
-    # Generate job ID and S3 key
     job_id = uuid4()
     s3_key = f"uploads/{job_id}{file_ext}"
 
-    # Stream upload to S3
     s3 = get_s3_service()
     try:
         await s3.upload_stream(file.file, s3_key)
-    except Exception as e:
-        logger.error(f"S3 upload failed for job {job_id}: {e}")
+    except Exception as exc:
+        logger.error("s3_upload_failed", job_id=str(job_id), error=str(exc))
         raise HTTPException(
             status_code=502,
             detail="Failed to upload file to storage. Please try again later.",
         )
 
-    logger.info(f"File uploaded to S3: {file.filename} -> {s3_key} ({size_mb:.2f} MB)")
+    logger.info(
+        "file_uploaded_to_s3",
+        job_id=str(job_id),
+        filename=file.filename,
+        s3_key=s3_key,
+        size_mb=round(size_mb, 2),
+    )
 
-    # Persist file metadata in PostgreSQL
-    metadata_record = FileMetadata(
+    db.add(FileMetadata(
         job_id=str(job_id),
         s3_key=s3_key,
         original_filename=file.filename,
         file_size_bytes=file_size,
-    )
-    db.add(metadata_record)
+    ))
     await db.commit()
 
-    # Insert job into the persistent Postgres queue
     record = await queue.enqueue_job(
         job_id=job_id,
         s3_key=s3_key,
         file_name=file.filename,
         file_size=file_size,
     )
-    logger.info("Job %s enqueued to Postgres queue", job_id)
+    logger.info("job_enqueued", job_id=str(job_id), source="direct_upload")
 
     return JobResponse(
         job_id=record.id,
@@ -332,17 +323,10 @@ async def upload_audio(
 
 @app.get("/status/{job_id}", response_model=JobResponse)
 async def get_job_status(job_id: UUID, job_store: JobStoreDep):
-    """
-    Get the current status of a processing job.
-    
-    Returns progress, status, and artifacts when complete.
-    
-    """
+    """Return progress, status, and (when complete) artifacts for a job."""
     job = await job_store.load(job_id)
-    
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
     return job
 
 
@@ -350,13 +334,9 @@ async def get_job_status(job_id: UUID, job_store: JobStoreDep):
 async def download_pdf(
     job_id: UUID,
     job_store: JobStoreDep,
-    session: Annotated[AsyncSession, Depends(get_async_session)],
+    session: DBSessionDep,
 ):
-    """
-    Download the generated PDF summary for a completed job.
-
-    Redirects the client to a short-lived presigned S3 URL for the PDF.
-    """
+    """Redirect the client to a short-lived presigned S3 URL for the PDF."""
     job = await job_store.load(job_id)
 
     if job is None:
@@ -368,19 +348,17 @@ async def download_pdf(
             detail=f"Job not complete. Current status: {job.status.value}",
         )
 
-    # Prefer S3 when the worker has stored a pdf_s3_key
     result = await session.execute(
         select(JobRecord.pdf_s3_key).where(JobRecord.id == job_id)
     )
     pdf_s3_key = result.scalar_one_or_none()
+    if not pdf_s3_key:
+        raise HTTPException(status_code=404, detail="PDF file not found")
 
-    if pdf_s3_key:
-        s3 = get_s3_service()
-        presigned_url = await s3.generate_presigned_get_url(pdf_s3_key, expires_in=3600)
-        return RedirectResponse(url=presigned_url, status_code=307)
-
-    # No S3 key means the PDF was never uploaded
-    raise HTTPException(status_code=404, detail="PDF file not found")
+    presigned_url = await get_s3_service().generate_presigned_get_url(
+        pdf_s3_key, expires_in=_PDF_DOWNLOAD_URL_TTL_SECONDS,
+    )
+    return RedirectResponse(url=presigned_url, status_code=307)
 
 
 @app.put("/artifacts/{job_id}", response_model=JobResponse)
@@ -418,29 +396,21 @@ async def update_artifacts(
 
 @app.get("/artifacts/{job_id}", response_model=MeetingArtifacts)
 async def get_artifacts(job_id: UUID, job_store: JobStoreDep):
-    """
-    Get the extracted artifacts as JSON for a completed job.
-    
-    """
+    """Return the extracted artifacts for a completed job."""
     job = await job_store.load(job_id)
-    
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
-    
+
     if job.status != ProcessingStatus.COMPLETED:
         raise HTTPException(
             status_code=400,
             detail=f"Job not complete. Current status: {job.status.value}",
         )
-    
-    if not job.artifacts:
-        # Try loading from cache directly
-        artifacts = await job_store.get_cached_artifacts(job_id)
-        if not artifacts:
-            raise HTTPException(status_code=404, detail="Artifacts not found")
-        return artifacts
-    
-    return job.artifacts
+
+    artifacts = job.artifacts or await job_store.get_cached_artifacts(job_id)
+    if not artifacts:
+        raise HTTPException(status_code=404, detail="Artifacts not found")
+    return artifacts
 
 
 @app.get("/export/jira/{job_id}")
@@ -482,14 +452,8 @@ async def export_jira(job_id: UUID, job_store: JobStoreDep):
 
 
 @app.get("/health")
-async def health_check(
-    db: DBSessionDep,
-):
-    """
-    Detailed health check for monitoring systems.
-
-    Reports database connectivity and the number of pending/processing jobs.
-    """
+async def health_check(db: DBSessionDep):
+    """Report database connectivity and the number of pending/processing jobs."""
     db_status = "healthy"
     pending = 0
     processing = 0
@@ -497,12 +461,8 @@ async def health_check(
         row = (
             await db.execute(
                 select(
-                    func.count()
-                    .filter(JobRecord.status == "pending")
-                    .label("pending"),
-                    func.count()
-                    .filter(JobRecord.status == "processing")
-                    .label("processing"),
+                    func.count().filter(JobRecord.status == "pending").label("pending"),
+                    func.count().filter(JobRecord.status == "processing").label("processing"),
                 )
             )
         ).one()
@@ -510,10 +470,8 @@ async def health_check(
     except Exception as exc:
         db_status = f"unhealthy: {exc}"
 
-    overall = "healthy" if db_status == "healthy" else "degraded"
-
     return {
-        "status": overall,
+        "status": "healthy" if db_status == "healthy" else "degraded",
         "components": {
             "database": {
                 "status": db_status,
@@ -530,12 +488,11 @@ async def health_check(
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
         port=8000,
-        workers=1,  # Use 1 for development, increase for production
         reload=settings.debug,
         log_level="info",
     )

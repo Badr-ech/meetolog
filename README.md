@@ -674,7 +674,10 @@ All variables are loaded via Pydantic Settings from environment variables (or `.
 | `TEST_MODE` | `false` | Mock all external services |
 | `LLM_PROVIDER` | `gemini` | `gemini` or `openai` |
 | `GEMINI_API_KEY` | `""` | Google Gemini API key |
+| `GEMINI_MODEL` | `gemini-2.5-flash-lite` | Gemini model used for extraction |
 | `OPENAI_API_KEY` | `""` | OpenAI API key |
+| `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model used for extraction |
+| `HF_TOKEN` | `""` | HuggingFace token enabling pyannote speaker diarization |
 | `WHISPER_MODEL` | `tiny` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
 | `DATABASE_URL` | `""` | PostgreSQL async DSN: `postgresql+asyncpg://user:pass@host/db` |
 | `AWS_ACCESS_KEY_ID` | `""` | AWS IAM access key (local dev only; production uses IAM task role) |

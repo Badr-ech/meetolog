@@ -3,7 +3,6 @@
 #
 # Services:
 #   db              PostgreSQL 15   (job queue, metadata, artifacts)
-#   redis           Redis 7         (unused — retained for future cache needs)
 #   minio           MinIO           (local S3-compatible object store)
 #   minio-setup     mc CLI          (one-shot bucket provisioning)
 #   api             FastAPI         (HTTP API on :8000)
@@ -18,9 +17,6 @@
 # =============================================================================
 
 services:
-  # ---------------------------------------------------------------------------
-  # PostgreSQL
-  # ---------------------------------------------------------------------------
   db:
     image: postgres:15-alpine
     ports:
@@ -39,24 +35,7 @@ services:
     networks:
       - meetolog
 
-  # ---------------------------------------------------------------------------
-  # Redis
-  # ---------------------------------------------------------------------------
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-    networks:
-      - meetolog
-
-  # ---------------------------------------------------------------------------
-  # MinIO – S3-compatible object storage
-  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible object storage for local development
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
@@ -76,9 +55,7 @@ services:
     networks:
       - meetolog
 
-  # ---------------------------------------------------------------------------
   # MinIO bucket provisioning (runs once then exits)
-  # ---------------------------------------------------------------------------
   minio-setup:
     image: minio/mc
     depends_on:
@@ -93,9 +70,6 @@ services:
     networks:
       - meetolog
 
-  # ---------------------------------------------------------------------------
-  # Backend API
-  # ---------------------------------------------------------------------------
   api:
     build:
       context: ./backend
@@ -113,9 +87,7 @@ services:
     networks:
       - meetolog
 
-  # ---------------------------------------------------------------------------
-  # Background Worker (stateless, horizontally scalable)
-  # ---------------------------------------------------------------------------
+  # Stateless background worker (horizontally scalable)
   worker:
     build:
       context: ./backend

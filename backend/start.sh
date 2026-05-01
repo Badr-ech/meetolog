@@ -13,23 +13,11 @@ set -euo pipefail
 
 SERVICE_TYPE="${SERVICE_TYPE:-web}"
 PORT="${PORT:-8000}"
-RUN_WORKER="${RUN_WORKER:-false}"
 
-echo "=========================================="
-echo " Meetolog – Starting service: ${SERVICE_TYPE}"
-echo "=========================================="
-
-# If RUN_WORKER=true, start the background worker alongside the API
-# (used for single-container deployments).
-if [ "${RUN_WORKER}" = "true" ] && [ "${SERVICE_TYPE}" = "web" ]; then
-    echo "→ Starting background worker in background (RUN_WORKER=true)..."
-    python -m app.worker &
-    sleep 2
-fi
+echo "Meetolog – starting service: ${SERVICE_TYPE}"
 
 case "${SERVICE_TYPE}" in
     web)
-        echo "→ Launching Uvicorn on port ${PORT}..."
         exec uvicorn app.main:app \
             --host 0.0.0.0 \
             --port "${PORT}" \
@@ -37,12 +25,11 @@ case "${SERVICE_TYPE}" in
             --log-level info
         ;;
     worker)
-        echo "→ Launching background worker..."
         exec python -m app.worker
         ;;
     *)
-        echo "ERROR: Unknown SERVICE_TYPE '${SERVICE_TYPE}'."
-        echo "       Valid values: web, worker"
+        echo "ERROR: Unknown SERVICE_TYPE '${SERVICE_TYPE}'." >&2
+        echo "       Valid values: web, worker" >&2
         exit 1
         ;;
 esac

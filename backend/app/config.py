@@ -37,7 +37,17 @@ class Settings(BaseSettings):
         default="",
         description="OpenAI API key for alternative LLM provider"
     )
-    
+
+    gemini_model: str = Field(
+        default="gemini-2.5-flash-lite",
+        description="Gemini model name used for extraction"
+    )
+
+    openai_model: str = Field(
+        default="gpt-4o-mini",
+        description="OpenAI model name used for extraction"
+    )
+
     whisper_model: Literal["tiny", "base", "small", "medium", "large"] = Field(
         default="tiny",
         description="Whisper model size. 'tiny' for free tier, 'base' for better accuracy."
@@ -184,7 +194,7 @@ class Settings(BaseSettings):
     @field_validator("gemini_api_key", "openai_api_key", mode="before")
     @classmethod
     def strip_api_key(cls, v: str) -> str:
-        """Strip whitespace from API key."""
+        """Strip whitespace from API key values."""
         if isinstance(v, str):
             return v.strip()
         return v or ""
@@ -192,5 +202,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Cached settings instance."""
+    """Return the cached settings instance."""
     return Settings()

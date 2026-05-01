@@ -21,7 +21,7 @@ from uuid import UUID
 
 import structlog
 
-# Add parent directory to path for imports when running as worker
+# Allow ``python -m app.worker`` from inside the backend/ directory.
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -32,12 +32,11 @@ from app.infrastructure.db import get_session_factory, close_db, init_db
 from app.infrastructure.postgres_queue import PostgresJobQueue
 from app.services.storage import S3StorageService
 
-# Initialise structured JSON logging before any log calls.
 configure_logging(json_output=True, log_level="INFO")
 
 logger = get_logger(component="worker")
 
-# Seconds to sleep when the queue is empty.
+# How long to sleep between Postgres polls when the queue is empty.
 POLL_INTERVAL_SECONDS = 5
 
 
@@ -340,25 +339,22 @@ async def worker_loop(worker_id: str | None = None) -> None:
     if worker_id is None:
         worker_id = f"worker-{os.getpid()}"
 
-    settings = get_settings()
-
-    # Register OS signal handlers for graceful shutdown
+    # Register signal handlers for graceful shutdown. ``add_signal_handler``
+    # is unsupported on Windows, so we fall back to ``signal.signal`` there.
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, _request_shutdown)
         except NotImplementedError:
-            # Windows does not support add_signal_handler
             signal.signal(sig, lambda *_: _request_shutdown())
 
     await init_db()
     session_factory = get_session_factory()
     s3_service = S3StorageService()
 
-    # NOTE: Whisper pre-warming is intentionally disabled when diarization is
-    # active.  Loading Whisper at startup would keep it resident in RAM while
-    # pyannote runs, pushing peak usage beyond the 2 GB Fargate budget.
-    # Whisper-tiny loads in ~2 s, so on-demand loading adds negligible latency.
+    # Whisper is loaded on demand, not at worker startup. When diarization is
+    # active the pyannote model needs the full RAM budget; loading Whisper
+    # eagerly would push peak usage beyond the 2 GB Fargate Spot budget.
 
     logger.info("worker_started", worker_id=worker_id, poll_interval=POLL_INTERVAL_SECONDS)
 

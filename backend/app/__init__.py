@@ -1,1 +1,1 @@
-# Meetolog Backend Application
+"""Meetolog backend application package."""

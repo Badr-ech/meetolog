@@ -757,4 +757,3 @@ def build_summarization_prompt(transcript: str) -> str:
         "---",
         _MEETING_SUMMARIZATION_INSTRUCTIONS,
     ])
-

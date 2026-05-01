@@ -97,44 +97,30 @@ class LLMProvider(ABC):
 
 
 class GeminiProvider(LLMProvider):
-    """
-    Google Gemini LLM provider for artifact extraction.
-    
-    Uses the Gemini 2.5 Flash Lite model for fast, cost-effective
-    extraction with good quality.
-    """
-    
-    def __init__(self, api_key: str):
-        """
-        Initialize Gemini provider.
-        
-        Args:
-            api_key: Google Gemini API key
-            
-        Raises:
-            ValueError: If API key is empty
-        """
+    """Google Gemini LLM provider for artifact extraction."""
+
+    def __init__(self, api_key: str, model: str = "gemini-2.5-flash-lite"):
         if not api_key:
             raise ValueError(
                 "GEMINI_API_KEY is required for GeminiProvider. "
                 "Set TEST_MODE=true to use mock extraction instead."
             )
-        
+
         self.api_key = api_key
+        self.model_name = model
         self._model = None
         self._genai = None
-        logger.info("GeminiProvider initialized")
-    
+        logger.info("GeminiProvider initialized (model=%s)", model)
+
     @property
     def provider_name(self) -> str:
         return "Google Gemini"
-    
+
     @property
     def is_mock(self) -> bool:
         return False
-    
+
     def _get_genai(self):
-        """Lazy load google.generativeai module."""
         if self._genai is None:
             try:
                 import google.generativeai as genai
@@ -145,15 +131,12 @@ class GeminiProvider(LLMProvider):
                     "Install it with: pip install google-generativeai"
                 ) from e
         return self._genai
-    
+
     def _get_model(self):
-        """Initialize and return the Gemini model."""
         if self._model is None:
             genai = self._get_genai()
-            logger.info("Initializing Gemini model")
             genai.configure(api_key=self.api_key)
-            self._model = genai.GenerativeModel("gemini-2.5-flash-lite")
-            logger.info("Gemini model initialized successfully")
+            self._model = genai.GenerativeModel(self.model_name)
         return self._model
     
     @retry(
@@ -230,49 +213,33 @@ class GeminiProvider(LLMProvider):
 
 
 class OpenAIProvider(LLMProvider):
-    """
-    OpenAI GPT-4 LLM provider for artifact extraction.
-    
-    Uses GPT-4o-mini for cost-effective extraction with excellent quality.
-    """
-    
+    """OpenAI Chat Completions LLM provider for artifact extraction."""
+
     def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
-        """
-        Initialize OpenAI provider.
-        
-        Args:
-            api_key: OpenAI API key
-            model: Model to use (default: gpt-4o-mini)
-            
-        Raises:
-            ValueError: If API key is empty
-        """
         if not api_key:
             raise ValueError(
                 "OPENAI_API_KEY is required for OpenAIProvider. "
                 "Set TEST_MODE=true to use mock extraction instead."
             )
-        
+
         self.api_key = api_key
         self.model = model
         self._client = None
-        logger.info(f"OpenAIProvider initialized with model: {model}")
-    
+        logger.info("OpenAIProvider initialized (model=%s)", model)
+
     @property
     def provider_name(self) -> str:
         return "OpenAI"
-    
+
     @property
     def is_mock(self) -> bool:
         return False
-    
+
     def _get_client(self):
-        """Lazy load OpenAI client."""
         if self._client is None:
             try:
                 from openai import OpenAI
                 self._client = OpenAI(api_key=self.api_key)
-                logger.info("OpenAI client initialized")
             except ImportError as e:
                 raise RuntimeError(
                     "openai is not installed. "
@@ -369,62 +336,52 @@ class OpenAIProvider(LLMProvider):
         return await self._call_openai(messages)
 
 
-def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExtractor":  # type: ignore[name-defined]
-    """
-    Return the configured LLM provider based on settings.
+def _mock_provider():
+    from .mock_services import MockExtractor
+    return MockExtractor(simulated_delay=0.3)
 
-    Falls back to MockExtractor when no API key is available.
-    """
+
+def get_llm_provider(settings: Settings | None = None) -> LLMProvider | "MockExtractor":  # type: ignore[name-defined]
+    """Return the configured LLM provider, falling back to a mock when no key is set."""
     if settings is None:
         settings = get_settings()
-    
-    # Test mode - use mock
+
     if settings.test_mode:
-        from .mock_services import MockExtractor
-        logger.info("TEST_MODE enabled: Using MockExtractor")
-        return MockExtractor(simulated_delay=0.3)
-    
+        logger.info("TEST_MODE enabled: using MockExtractor")
+        return _mock_provider()
+
     provider = settings.llm_provider.lower()
-    
-    # OpenAI provider
+
     if provider == "openai":
         if not settings.openai_api_key:
-            from .mock_services import MockExtractor
-            logger.warning(
-                "OPENAI_API_KEY is not set. "
-                "Using MockExtractor. Set the API key for real extraction."
-            )
-            return MockExtractor(simulated_delay=0.3)
-        
+            logger.warning("OPENAI_API_KEY is not set; falling back to MockExtractor")
+            return _mock_provider()
         try:
-            return OpenAIProvider(api_key=settings.openai_api_key)
-        except Exception as e:
-            logger.error(f"Failed to initialize OpenAIProvider: {e}")
-            from .mock_services import MockExtractor
-            return MockExtractor(simulated_delay=0.3)
-    
-    # Gemini provider (default)
+            return OpenAIProvider(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+            )
+        except Exception as exc:
+            logger.error("Failed to initialise OpenAIProvider: %s", exc)
+            return _mock_provider()
+
+    # Default: Gemini
     if not settings.gemini_api_key:
-        from .mock_services import MockExtractor
-        logger.warning(
-            "GEMINI_API_KEY is not set. "
-            "Using MockExtractor. Set the API key for real extraction."
-        )
-        return MockExtractor(simulated_delay=0.3)
-    
+        logger.warning("GEMINI_API_KEY is not set; falling back to MockExtractor")
+        return _mock_provider()
     try:
-        return GeminiProvider(api_key=settings.gemini_api_key)
-    except Exception as e:
-        logger.error(f"Failed to initialize GeminiProvider: {e}")
-        from .mock_services import MockExtractor
-        return MockExtractor(simulated_delay=0.3)
+        return GeminiProvider(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model,
+        )
+    except Exception as exc:
+        logger.error("Failed to initialise GeminiProvider: %s", exc)
+        return _mock_provider()
 
 
-# For backwards compatibility with LLMExtractor interface
-# The LLMProvider class provides the same interface
 __all__ = [
     "LLMProvider",
-    "GeminiProvider", 
+    "GeminiProvider",
     "OpenAIProvider",
     "get_llm_provider",
 ]

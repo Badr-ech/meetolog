@@ -252,9 +252,7 @@ class ProcessingStatus(str, Enum):
     FAILED = "failed"
 
 
-# ---------------------------------------------------------------------------
-# Backward-compatibility mapping for Redis records written before v1.1
-# ---------------------------------------------------------------------------
+# Backward-compatibility mapping for status values written by pre-v1.1 jobs.
 _LEGACY_STATUS_MAP: dict[str, ProcessingStatus] = {
     "pending": ProcessingStatus.UPLOADING,
     "processing": ProcessingStatus.TRANSCRIBING,

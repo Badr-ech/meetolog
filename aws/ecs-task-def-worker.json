@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
   "memory": "4096",
-  "executionRoleArn": "arn:aws:iam::932705495489:role/meetolog-ecs-execution-role",
-  "taskRoleArn": "arn:aws:iam::932705495489:role/meetolog-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-task-role",
   "containerDefinitions": [
     {
       "name": "meetolog-worker",
-      "image": "932705495489.dkr.ecr.us-east-1.amazonaws.com/meetolog:latest",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/meetolog:latest",
       "essential": true,
       "environment": [
         { "name": "SERVICE_TYPE", "value": "worker" },
@@ -21,15 +21,15 @@
       "secrets": [
         {
           "name": "DATABASE_URL",
-          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/DATABASE_URL"
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/DATABASE_URL"
         },
         {
           "name": "AWS_S3_BUCKET",
-          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/AWS_S3_BUCKET"
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/AWS_S3_BUCKET"
         },
         {
           "name": "GEMINI_API_KEY",
-          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/GEMINI_API_KEY"
+          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/GEMINI_API_KEY"
         }
       ],
       "logConfiguration": {

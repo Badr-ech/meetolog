@@ -96,66 +96,37 @@ Sarah: Perfect. Let's wrap up. Good meeting everyone!
         return self.MOCK_TRANSCRIPT
     
     async def preprocess_transcript(self, raw_transcript: str) -> str:
-        """
-        Perform basic preprocessing on the transcript.
-        Same logic as production - no mocking needed here.
-        """
-        lines = raw_transcript.strip().split('\n')
-        cleaned_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if line:
-                line = ' '.join(line.split())
-                cleaned_lines.append(line)
-        
-        return '\n'.join(cleaned_lines)
+        """Apply the same whitespace normalisation as the real transcriber."""
+        lines = (line.strip() for line in raw_transcript.strip().splitlines())
+        return "\n".join(" ".join(line.split()) for line in lines if line)
 
 
 class MockExtractor(LLMExtractor):
-    """
-    Mock LLM extraction service for testing.
-    
-    Returns deterministic, valid MeetingArtifacts that match the expected
-    schema. The data is realistic and useful for testing downstream
-    components like PDF generation.
-    """
-    
+    """Deterministic in-memory extractor used for tests and ``TEST_MODE``."""
+
     def __init__(self, simulated_delay: float = 0.3):
-        """
-        Initialize the mock extractor.
-        
-        Args:
-            simulated_delay: Seconds to wait before returning (simulates API call)
-        """
         self._delay = simulated_delay
         logger.info("MockExtractor initialized (TEST_MODE)")
-    
+
     @property
     def provider_name(self) -> str:
-        """Human-readable provider name."""
         return "Mock"
-    
+
     @property
     def is_mock(self) -> bool:
-        """This is a mock implementation."""
         return True
-    
+
     async def generate_text(self, prompt: str) -> str:
         """Return a truncated echo of the prompt for testing."""
         await asyncio.sleep(self._delay)
         return f"Mock summary of input text ({len(prompt)} chars)."
 
     async def extract_artifacts(self, transcript: str) -> MeetingArtifacts:
-        """
-        Return deterministic mock artifacts matching the MeetingArtifacts schema.
-        """
+        """Return deterministic, schema-valid artifacts after a small delay."""
         logger.info("MockExtractor: Generating mock artifacts")
-        
-        # Simulate API processing time
+
         await asyncio.sleep(self._delay)
-        
-        # Create deterministic mock data
+
         artifacts = MeetingArtifacts(
             meeting_id=uuid4(),
             meeting_title="Sprint Planning - User Authentication Feature",
@@ -336,8 +307,9 @@ class MockExtractor(LLMExtractor):
             ],
             transcript=transcript,
         )
-        
-        logger.info(f"MockExtractor: Generated {len(artifacts.user_stories)} stories, "
-                   f"{len(artifacts.tasks)} tasks, {len(artifacts.decisions)} decisions")
-        
+
+        logger.info(
+            "MockExtractor: generated %d stories, %d tasks, %d decisions",
+            len(artifacts.user_stories), len(artifacts.tasks), len(artifacts.decisions),
+        )
         return artifacts

@@ -34,16 +34,15 @@ __all__ = [
     "WhisperTranscriber",
     "ProgressCallback",
     "TranscriptSegment",
-    "_get_cached_model",
 ]
 
-# 2-arg callback: (chunk_index, total_chunks)
+# Callback signature: (chunk_index, total_chunks) -> awaitable
 ProgressCallback = Callable[[int, int], Awaitable[None]]
 
-# Lazy import whisper to allow mock mode without whisper installed
+# Lazily imported so TEST_MODE works without openai-whisper installed.
 _whisper = None
-# Singleton model cache: keeps the loaded model in memory across jobs
-# so we don't reload from disk (~2-3s) on every transcription request
+
+# Process-wide model cache: avoids the ~2 s disk reload on every transcription.
 _model_cache: dict[str, object] = {}
 
 
