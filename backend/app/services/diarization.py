@@ -128,7 +128,7 @@ class SpeakerDiarizer:
         logger.info("Loading pyannote speaker-diarization-3.1 pipeline")
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            use_auth_token=self._hf_token,
+            token=self._hf_token,
         )
         pipeline.to(torch.device("cpu"))
 

@@ -4,12 +4,12 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "256",
   "memory": "512",
-  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-execution-role",
-  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/meetolog-ecs-task-role",
+  "executionRoleArn": "arn:aws:iam::932705495489:role/meetolog-ecs-execution-role",
+  "taskRoleArn": "arn:aws:iam::932705495489:role/meetolog-ecs-task-role",
   "containerDefinitions": [
     {
       "name": "meetolog-api",
-      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/meetolog:latest",
+      "image": "932705495489.dkr.ecr.us-east-1.amazonaws.com/meetolog:latest",
       "essential": true,
       "portMappings": [
         {
@@ -24,24 +24,24 @@
         { "name": "WHISPER_MODEL", "value": "tiny" },
         { "name": "LLM_PROVIDER", "value": "gemini" },
         { "name": "TEST_MODE", "value": "false" },
-        { "name": "AWS_REGION", "value": "<REGION>" }
+        { "name": "AWS_REGION", "value": "us-east-1" }
       ],
       "secrets": [
         {
           "name": "DATABASE_URL",
-          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/DATABASE_URL"
+          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/DATABASE_URL"
         },
         {
           "name": "AWS_S3_BUCKET",
-          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/AWS_S3_BUCKET"
+          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/AWS_S3_BUCKET"
         },
         {
           "name": "GEMINI_API_KEY",
-          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/GEMINI_API_KEY"
+          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/GEMINI_API_KEY"
         },
         {
           "name": "CORS_ORIGINS",
-          "valueFrom": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/meetolog/CORS_ORIGINS"
+          "valueFrom": "arn:aws:ssm:us-east-1:932705495489:parameter/meetolog/CORS_ORIGINS"
         }
       ],
       "healthCheck": {
@@ -55,7 +55,7 @@
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/meetolog-api",
-          "awslogs-region": "<REGION>",
+          "awslogs-region": "us-east-1",
           "awslogs-stream-prefix": "api"
         }
       }

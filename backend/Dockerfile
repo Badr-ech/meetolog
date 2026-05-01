@@ -60,7 +60,9 @@ RUN pip install --no-cache-dir /wheels/* \
 # home directory cache (~/.cache/whisper/).  Switch to appuser first so
 # the cached model is owned by the runtime user.
 USER appuser
-RUN python -c "import whisper; whisper.load_model('tiny')"
+# Model download skipped at build time — will download on first worker cold-start.
+# Re-enable once Docker Desktop DNS is stable to bake the model into the image.
+# RUN python -c "import whisper; whisper.load_model('tiny')"
 USER root
 
 # Copy application source (owned by appuser for runtime writes to /tmp)

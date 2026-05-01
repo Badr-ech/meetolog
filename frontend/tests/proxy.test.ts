@@ -41,7 +41,9 @@ describe("next.config.js proxy rewrites", () => {
 
   it("defaults backend URL to http://localhost:8000 when env is unset", () => {
     const saved = process.env.API_URL;
+    const savedPublic = process.env.NEXT_PUBLIC_API_URL;
     delete process.env.API_URL;
+    delete process.env.NEXT_PUBLIC_API_URL;
 
     jest.resetModules();
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -57,12 +59,47 @@ describe("next.config.js proxy rewrites", () => {
       if (saved !== undefined) {
         process.env.API_URL = saved;
       }
+      if (savedPublic !== undefined) {
+        process.env.NEXT_PUBLIC_API_URL = savedPublic;
+      }
+    });
+  });
+
+  it("uses NEXT_PUBLIC_API_URL when set", () => {
+    const saved = process.env.API_URL;
+    const savedPublic = process.env.NEXT_PUBLIC_API_URL;
+    process.env.API_URL = "https://api.example.com";
+    process.env.NEXT_PUBLIC_API_URL = "https://public-api.example.com";
+
+    jest.resetModules();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const freshConfig = require("../next.config.js");
+    const rules: RewriteRule[] | Promise<RewriteRule[]> = freshConfig.rewrites();
+    const resolved = rules instanceof Promise ? rules : Promise.resolve(rules);
+
+    return resolved.then((r) => {
+      const apiRule = r.find((rule) => rule.source === "/api/:path*");
+      expect(apiRule).toBeDefined();
+      expect(apiRule!.destination).toMatch(/https:\/\/public-api\.example\.com/);
+
+      if (saved !== undefined) {
+        process.env.API_URL = saved;
+      } else {
+        delete process.env.API_URL;
+      }
+      if (savedPublic !== undefined) {
+        process.env.NEXT_PUBLIC_API_URL = savedPublic;
+      } else {
+        delete process.env.NEXT_PUBLIC_API_URL;
+      }
     });
   });
 
   it("uses API_URL when set", () => {
     const saved = process.env.API_URL;
+    const savedPublic = process.env.NEXT_PUBLIC_API_URL;
     process.env.API_URL = "https://api.example.com";
+    delete process.env.NEXT_PUBLIC_API_URL;
 
     jest.resetModules();
     // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -79,6 +116,9 @@ describe("next.config.js proxy rewrites", () => {
         process.env.API_URL = saved;
       } else {
         delete process.env.API_URL;
+      }
+      if (savedPublic !== undefined) {
+        process.env.NEXT_PUBLIC_API_URL = savedPublic;
       }
     });
   });

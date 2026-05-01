@@ -48,6 +48,7 @@ def _get_engine():
         pool_size=10,
         max_overflow=20,
         pool_pre_ping=True,
+        # SSL is configured via ?ssl=require in the DATABASE_URL
     )
     logger.info("Async SQLAlchemy engine created")
     return _engine

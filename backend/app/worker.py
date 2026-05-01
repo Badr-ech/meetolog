@@ -355,15 +355,10 @@ async def worker_loop(worker_id: str | None = None) -> None:
     session_factory = get_session_factory()
     s3_service = S3StorageService()
 
-    # Pre-warm Whisper model
-    if not settings.test_mode:
-        try:
-            logger.info("whisper_prewarm_start", model=settings.whisper_model)
-            from app.services.transcription import _get_cached_model
-            await asyncio.to_thread(_get_cached_model, settings.whisper_model)
-            logger.info("whisper_prewarm_done")
-        except Exception as exc:
-            logger.warning("whisper_prewarm_failed", error=str(exc))
+    # NOTE: Whisper pre-warming is intentionally disabled when diarization is
+    # active.  Loading Whisper at startup would keep it resident in RAM while
+    # pyannote runs, pushing peak usage beyond the 2 GB Fargate budget.
+    # Whisper-tiny loads in ~2 s, so on-demand loading adds negligible latency.
 
     logger.info("worker_started", worker_id=worker_id, poll_interval=POLL_INTERVAL_SECONDS)
 
