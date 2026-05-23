@@ -158,9 +158,10 @@ async def run_chunk_workers(
 
     try:
         session = aioboto3.Session()
+        launched = 0
         async with session.client("ecs", region_name=region) as ecs:
-            for _ in range(num_workers):
-                await ecs.run_task(
+            for i in range(num_workers):
+                resp = await ecs.run_task(
                     cluster=cluster,
                     taskDefinition=task_definition,
                     launchType="FARGATE",
@@ -176,10 +177,28 @@ async def run_chunk_workers(
                         ],
                     },
                 )
+                failures = resp.get("failures", [])
+                if failures:
+                    logger.error(
+                        "chunk_worker_run_task_failed",
+                        worker_index=i,
+                        job_id=str(job_id),
+                        failures=failures,
+                    )
+                else:
+                    task_arns = [t.get("taskArn") for t in resp.get("tasks", [])]
+                    logger.info(
+                        "chunk_worker_task_started",
+                        worker_index=i,
+                        job_id=str(job_id),
+                        task_arns=task_arns,
+                    )
+                    launched += 1
         logger.info(
-            "chunk_workers_launched",
+            "chunk_workers_launch_summary",
             job_id=str(job_id),
-            num_workers=num_workers,
+            requested=num_workers,
+            launched=launched,
         )
     except Exception as exc:
         logger.warning(
@@ -214,7 +233,7 @@ async def run_assembler(
     try:
         session = aioboto3.Session()
         async with session.client("ecs", region_name=region) as ecs:
-            await ecs.run_task(
+            resp = await ecs.run_task(
                 cluster=cluster,
                 taskDefinition=task_definition,
                 launchType="FARGATE",
@@ -233,7 +252,16 @@ async def run_assembler(
                     ],
                 },
             )
-        logger.info("assembler_launched", job_id=str(job_id))
+        failures = resp.get("failures", [])
+        if failures:
+            logger.error(
+                "assembler_run_task_failed",
+                job_id=str(job_id),
+                failures=failures,
+            )
+        else:
+            task_arns = [t.get("taskArn") for t in resp.get("tasks", [])]
+            logger.info("assembler_launched", job_id=str(job_id), task_arns=task_arns)
     except Exception as exc:
         logger.warning(
             "assembler_launch_failed",

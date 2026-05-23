@@ -190,7 +190,7 @@ class Settings(BaseSettings):
         description="ECS cluster name used for worker auto-scaling",
     )
     ecs_worker_service: str = Field(
-        default="meetolog-worker",
+        default="meetolog-worker-svc",
         description="ECS service name for the background worker / splitter",
     )
     ecs_worker_task_definition: str = Field(
