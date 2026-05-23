@@ -18,6 +18,9 @@ echo "Meetolog – starting service: ${SERVICE_TYPE}"
 
 case "${SERVICE_TYPE}" in
     web)
+        echo "Running database migrations..."
+        alembic --config /app/alembic.ini upgrade head
+        echo "Migrations complete. Starting API server..."
         exec uvicorn app.main:app \
             --host 0.0.0.0 \
             --port "${PORT}" \

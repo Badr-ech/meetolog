@@ -29,6 +29,7 @@ from app.config import get_settings
 from app.core.logger import configure_logging, get_logger
 from app.models import MeetingArtifacts, ProcessingStatus
 from app.infrastructure.db import get_session_factory, close_db, init_db
+from app.infrastructure.ecs_scaler import scale_worker_down
 from app.infrastructure.postgres_queue import PostgresJobQueue
 from app.services.storage import S3StorageService
 
@@ -38,6 +39,51 @@ logger = get_logger(component="worker")
 
 # How long to sleep between Postgres polls when the queue is empty.
 POLL_INTERVAL_SECONDS = 5
+
+
+# ---------------------------------------------------------------------------
+# Cancellation sentinel
+# ---------------------------------------------------------------------------
+
+class _JobCancelledError(Exception):
+    """Raised inside process_job when the database signals a cancellation.
+
+    This is an internal control-flow signal — it is never propagated beyond
+    the ``except _JobCancelledError`` handler in :func:`process_job`.  Using
+    a dedicated exception class (rather than a flag variable) means the
+    cancellation abort point is *guaranteed* to be the next ``await`` after
+    the check regardless of how deeply nested the call is at the time.
+    """
+
+
+async def _check_cancellation(
+    job_id: UUID,
+    queue: PostgresJobQueue,
+    job_logger,
+) -> None:
+    """Query the job status and raise :exc:`_JobCancelledError` if cancelled.
+
+    This is a lightweight read (no ``FOR UPDATE`` lock) executed at the
+    start of each expensive processing boundary.  Because the worker's
+    session commits after every ``update_job_progress`` call, the session
+    is always in a clean state when this is invoked and the SELECT is free
+    of uncommitted write contention.
+
+    Parameters
+    ----------
+    job_id:
+        UUID of the job being processed.
+    queue:
+        The job queue data-access object sharing the worker's session.
+    job_logger:
+        Bound structlog logger for the current job.
+    """
+    status = await queue.fetch_job_status(job_id)
+    if status == "cancelled":
+        job_logger.info("cancellation_detected", job_id=str(job_id))
+        raise _JobCancelledError(
+            f"Job {job_id} was cancelled — aborting worker processing"
+        )
 
 
 def _get_transcriber():
@@ -111,6 +157,9 @@ async def process_job(
             job_logger.info("s3_download_start", s3_key=s3_key)
             await s3_service.download_to_file(s3_key, str(audio_path))
 
+            # Checkpoint 1: after download, before any expensive CPU work.
+            await _check_cancellation(job_id, queue, job_logger)
+
             # --- Stage 0 (optional): Speaker Diarization ---
             settings = get_settings()
             diarization_enabled = bool(settings.hf_token) and not settings.test_mode
@@ -166,6 +215,10 @@ async def process_job(
                 span_pct = 25
 
                 async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
+                    # Checkpoint 2a: before writing progress for the next chunk.
+                    # Fires between every 5-minute audio segment, giving the
+                    # worker an opportunity to abort before the next Whisper call.
+                    await _check_cancellation(job_id, queue, job_logger)
                     pct = base_pct + int(span_pct * ((chunk_idx + 1) / total))
                     job_logger.info(
                         "transcription_progress",
@@ -191,6 +244,10 @@ async def process_job(
             else:
                 # Original path — plain text transcription
                 async def _on_transcription_progress(chunk_idx: int, total: int) -> None:
+                    # Checkpoint 2b: before writing progress for the next chunk.
+                    # Fires between every 5-minute audio segment, giving the
+                    # worker an opportunity to abort before the next Whisper call.
+                    await _check_cancellation(job_id, queue, job_logger)
                     pct = 25 + int(23 * ((chunk_idx + 1) / total))
                     job_logger.info(
                         "transcription_progress",
@@ -215,6 +272,9 @@ async def process_job(
             transcription_time = time.monotonic() - start_time
             job_logger.info("transcription_complete", duration_seconds=round(transcription_time, 2))
 
+            # Checkpoint 3: after transcription, before LLM extraction.
+            await _check_cancellation(job_id, queue, job_logger)
+
             # --- Stage 2: LLM Extraction ---
             await queue.update_job_progress(
                 job_id,
@@ -235,6 +295,10 @@ async def process_job(
             }
 
             async def _on_extraction_stage(stage: str, detail: str) -> None:
+                # Checkpoint 4: at each LLM pipeline sub-stage boundary.
+                # Fires between summarizing → compressing → retrieving → extracting,
+                # allowing the worker to abort before the next API call.
+                await _check_cancellation(job_id, queue, job_logger)
                 pct = _STAGE_PCT.get(stage, 50)
                 await queue.update_job_progress(job_id, progress=pct, message=detail)
 
@@ -255,6 +319,9 @@ async def process_job(
             del llm_provider
             gc.collect()
 
+            # Checkpoint 5: after extraction, before PDF generation.
+            await _check_cancellation(job_id, queue, job_logger)
+
             # --- Stage 3: PDF Generation (into temp dir) ---
             await queue.update_job_progress(
                 job_id,
@@ -270,6 +337,12 @@ async def process_job(
 
             pdf_time = time.monotonic() - start_time - transcription_time - extraction_time
             job_logger.info("pdf_generated", duration_seconds=round(pdf_time, 2))
+
+            # Checkpoint 6: after PDF generation, before S3 upload.
+            # This is the last opportunity to abort before writing permanent
+            # artefacts into S3. A cancellation here discards the local PDF
+            # file (deleted with the TemporaryDirectory) without polluting S3.
+            await _check_cancellation(job_id, queue, job_logger)
 
             # --- Stage 4: Upload results to S3 ---
             await queue.update_job_progress(
@@ -292,6 +365,19 @@ async def process_job(
                 artifacts_s3_key=artifacts_s3_key,
             )
             final_status = "completed"
+
+    except _JobCancelledError:
+        # The API has already written ``status = 'cancelled'`` in the database.
+        # The TemporaryDirectory context manager above has already cleaned up
+        # the /tmp working directory as part of normal __exit__ processing.
+        # There is nothing further to persist — we simply log and return.
+        duration = round(time.monotonic() - start_time, 2)
+        job_logger.info(
+            "job_cancelled_gracefully",
+            job_id=str(job_id),
+            duration_seconds=duration,
+        )
+        final_status = "cancelled"
 
     except FileNotFoundError as exc:
         job_logger.error("job_error", error=f"Audio file not found: {exc}")
@@ -335,6 +421,10 @@ async def worker_loop(worker_id: str | None = None) -> None:
 
     The loop exits cleanly on SIGINT / SIGTERM.  If no job is available
     it sleeps for ``POLL_INTERVAL_SECONDS`` to avoid wasteful queries.
+
+    Auto scale-down: after ``settings.worker_idle_shutdown_polls`` consecutive
+    empty polls the worker calls ECS to set its own desired count to 0, then
+    exits.  The API will scale it back up the next time a job is enqueued.
     """
     if worker_id is None:
         worker_id = f"worker-{os.getpid()}"
@@ -348,6 +438,7 @@ async def worker_loop(worker_id: str | None = None) -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: _request_shutdown())
 
+    settings = get_settings()
     await init_db()
     session_factory = get_session_factory()
     s3_service = S3StorageService()
@@ -356,7 +447,14 @@ async def worker_loop(worker_id: str | None = None) -> None:
     # active the pyannote model needs the full RAM budget; loading Whisper
     # eagerly would push peak usage beyond the 2 GB Fargate Spot budget.
 
-    logger.info("worker_started", worker_id=worker_id, poll_interval=POLL_INTERVAL_SECONDS)
+    logger.info(
+        "worker_started",
+        worker_id=worker_id,
+        poll_interval=POLL_INTERVAL_SECONDS,
+        idle_shutdown_polls=settings.worker_idle_shutdown_polls,
+    )
+
+    idle_polls = 0
 
     try:
         while not _shutdown_event.is_set():
@@ -365,6 +463,27 @@ async def worker_loop(worker_id: str | None = None) -> None:
                 record = await queue.claim_next_job(worker_id)
 
             if record is None:
+                idle_polls += 1
+                logger.debug(
+                    "queue_empty",
+                    idle_polls=idle_polls,
+                    shutdown_after=settings.worker_idle_shutdown_polls,
+                )
+
+                if idle_polls >= settings.worker_idle_shutdown_polls:
+                    logger.info(
+                        "worker_idle_scaling_down",
+                        idle_polls=idle_polls,
+                        worker_id=worker_id,
+                    )
+                    await scale_worker_down(
+                        cluster=settings.ecs_cluster,
+                        service=settings.ecs_worker_service,
+                        region=settings.aws_region,
+                    )
+                    _shutdown_event.set()
+                    break
+
                 try:
                     await asyncio.wait_for(
                         _shutdown_event.wait(),
@@ -374,6 +493,8 @@ async def worker_loop(worker_id: str | None = None) -> None:
                     pass
                 continue
 
+            # Job found — reset the idle counter.
+            idle_polls = 0
             logger.info("job_claimed", job_id=str(record.id), worker_id=worker_id)
 
             # Each job gets its own session so a failure cannot poison

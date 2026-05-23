@@ -560,6 +560,49 @@ This three-temperature approach is separate from the `tenacity` retry logic that
 - **Timeout Protection** — LLM extraction uses `asyncio.timeout(60)`. Whisper runs in a thread pool with inherited OS-level timeout.
 - **Stale-Lock Recovery** — The PostgreSQL queue reclaims jobs stuck in `processing` when `locked_at` exceeds 2 hours. Crashed workers' jobs are automatically retried.
 - **Uncrashable Worker Loop** — Each job is wrapped in `try … except Exception`. Failures mark the job as `failed` and the worker continues polling.
+- **Graceful Cancellation** — See below.
+
+### Graceful Job Cancellation
+
+Meetolog supports user-initiated cancellation of any queued or in-progress transcription job. Cancellation is coordinated entirely via a database status flag — no inter-process signals, message queues, or shared memory are required. This keeps the API and worker fully stateless and compatible with horizontal scaling.
+
+**State machine addition:**
+
+```
+pending ──────────────────────────────────────► cancelled
+    │                                               ▲
+    └─► processing ──► completed (terminal)         │
+              │                                     │
+              └──────────────────────────────────────┘
+              │
+              └─► failed (retryable or terminal)
+```
+
+`cancelled` is a permanent terminal state. A `cancelled` job cannot transition to `completed`, `failed`, or back to `pending`. Attempting to cancel a `completed` or `failed` job returns HTTP 409.
+
+**How cancellation works end-to-end:**
+
+1. **Frontend trigger (explicit)** — The user clicks "Cancel Processing" during an active polling session. The client immediately stops the poll loop, optimistically updates local state to `cancelled`, and calls `POST /api/jobs/{job_id}/cancel`. The server response replaces the optimistic state with the authoritative job record.
+
+2. **Frontend trigger (page abandonment)** — When the user closes the tab or reloads while a job is in flight, the `beforeunload` event handler fires `navigator.sendBeacon("/api/jobs/{job_id}/cancel")`. `sendBeacon` is guaranteed to complete the POST even as the page unloads; no response is awaited or needed.
+
+3. **API layer** — `POST /jobs/{job_id}/cancel` executes an atomic SQL `UPDATE` guarded by `WHERE status NOT IN ('completed', 'failed')`. This prevents clobbering a job that races to a terminal state between the status read and the write. The `cancelled_at` timestamp is recorded for observability. Worker lock fields (`locked_at`, `locked_by`) are cleared.
+
+4. **Worker polling** — At every significant processing boundary the worker calls `queue.fetch_job_status(job_id)` (a non-locking `SELECT`). The boundaries are:
+   - After S3 audio download (before any CPU work begins)
+   - Before each 5-minute Whisper transcription chunk (via the progress callback)
+   - After transcription completes, before LLM extraction begins
+   - Before each LLM pipeline sub-stage (summarising → compressing → retrieving → extracting)
+   - After artifact extraction, before PDF generation
+   - After PDF generation, before S3 upload (last opportunity to avoid writing permanent artefacts)
+
+5. **Worker abort** — When the status reads `cancelled`, the worker raises an internal `_JobCancelledError` sentinel. This propagates out of the `with tempfile.TemporaryDirectory(...)` block, which automatically deletes the `/tmp` working directory. The dedicated `except _JobCancelledError` handler logs `job_cancelled_gracefully` and exits cleanly — it does **not** call `mark_job_failed`, leaving the database status as `cancelled` without triggering the retry mechanism.
+
+**Guarantees:**
+- A `pending` job cancelled before any worker claims it will never be processed — the `claim_next_job` query's `WHERE status = 'pending'` clause excludes cancelled rows.
+- A `processing` job will be cancelled within at most one Whisper chunk boundary (≤ 5 minutes for standard recordings).
+- No S3 artefacts (PDF, artifact JSON) are written for cancelled jobs.
+- The `/tmp` session directory is always cleaned up, regardless of which checkpoint triggers the abort.
 
 ---
 

@@ -377,6 +377,67 @@
   max-height: 400px;
 }
 
+/* Cancel processing button */
+.cancelWrapper {
+  max-width: 600px;
+  margin: -0.5rem auto 2rem;
+  display: flex;
+  justify-content: center;
+}
+
+.cancelButton {
+  padding: 0.5rem 1.25rem;
+  border: 1.5px solid #dc2626;
+  border-radius: 6px;
+  background: transparent;
+  color: #dc2626;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.cancelButton:hover:not(:disabled) {
+  background: #fef2f2;
+}
+
+.cancelButton:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* Cancellation confirmation card */
+.cancelledHeader {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #92400e;
+  margin-bottom: 0.75rem;
+}
+
+.cancelledBody {
+  font-size: 0.9rem;
+  color: #6b7280;
+  line-height: 1.6;
+  margin-bottom: 1.25rem;
+}
+
+.resetButton {
+  display: inline-block;
+  padding: 0.55rem 1.25rem;
+  border: none;
+  border-radius: 6px;
+  background: #2563eb;
+  color: white;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+
+.resetButton:hover {
+  background: #1d4ed8;
+}
+
 /* Responsive */
 @media (max-width: 640px) {
   .title {

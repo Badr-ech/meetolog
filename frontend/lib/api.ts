@@ -251,6 +251,35 @@ export async function getJobStatus(jobId: string): Promise<JobResponse> {
   return data;
 }
 
+/**
+ * Request cancellation of a queued or in-progress transcription job.
+ *
+ * The endpoint is idempotent: calling it on a job that is already
+ * ``cancelled`` succeeds with the current job state.  It returns HTTP 409
+ * for terminal jobs (``completed`` / ``failed``) and HTTP 404 when the
+ * job ID is unknown.
+ *
+ * @param jobId  UUID of the job to cancel.
+ * @returns The updated JobResponse reflecting the cancelled state.
+ * @throws Error when the server returns a non-2xx status.
+ */
+export async function cancelJob(jobId: string): Promise<JobResponse> {
+  const response = await fetch(`${API_BASE}/jobs/${jobId}/cancel`, {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    const error = await safeJson<{ detail?: string }>(response);
+    throw new Error(
+      error?.detail || `Failed to cancel job (HTTP ${response.status})`,
+    );
+  }
+
+  const data = await safeJson<JobResponse>(response);
+  if (!data) throw new Error("Invalid cancel response from server");
+  return data;
+}
+
 export function getPdfDownloadUrl(jobId: string): string {
   return `${API_BASE}/download/${jobId}`;
 }
@@ -297,7 +326,11 @@ export function pollJobStatus(
         consecutiveErrors = 0; // Reset on success
         onUpdate(status);
 
-        if (status.status === "completed" || status.status === "failed") {
+        if (
+          status.status === "completed" ||
+          status.status === "failed" ||
+          status.status === "cancelled"
+        ) {
           break;
         }
       } catch (error) {

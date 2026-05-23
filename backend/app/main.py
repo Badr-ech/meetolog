@@ -4,6 +4,7 @@ Exposes endpoints for audio upload (direct or presigned), job status
 polling, artifact retrieval/editing, PDF download, and Jira export.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -18,11 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .core.logger import configure_logging, get_logger
-from .models import JobResponse, ProcessingStatus, MeetingArtifacts
+from .models import JobResponse, ProcessingStatus, MeetingArtifacts, parse_processing_status
 from .models.metadata import FileMetadata
 from .models.db_models import JobRecord
 from .infrastructure.db import get_async_session, init_db, close_db
 from .infrastructure.postgres_job_store import PostgresJobStore
+from .infrastructure.ecs_scaler import scale_worker_up
 from .infrastructure.postgres_queue import PostgresJobQueue
 from .services.jira_mapper import map_artifacts_to_jira
 from .services.storage import S3StorageService
@@ -231,6 +233,15 @@ async def enqueue_job(
     )
     logger.info("job_enqueued", job_id=str(job_id), source="presigned_upload")
 
+    # Wake the worker if it is scaled to 0. Fire-and-forget — a failure
+    # here must never block the response; the job is already in the DB and
+    # will be picked up once the worker is running.
+    asyncio.create_task(scale_worker_up(
+        cluster=settings.ecs_cluster,
+        service=settings.ecs_worker_service,
+        region=settings.aws_region,
+    ))
+
     return JobResponse(
         job_id=record.id,
         status=ProcessingStatus.UPLOADING,
@@ -312,6 +323,13 @@ async def upload_audio(
         file_size=file_size,
     )
     logger.info("job_enqueued", job_id=str(job_id), source="direct_upload")
+
+    # Wake the worker if it is scaled to 0.
+    asyncio.create_task(scale_worker_up(
+        cluster=settings.ecs_cluster,
+        service=settings.ecs_worker_service,
+        region=settings.aws_region,
+    ))
 
     return JobResponse(
         job_id=record.id,
@@ -449,6 +467,56 @@ async def export_jira(job_id: UUID, job_store: JobStoreDep):
             "Content-Disposition": f'attachment; filename="meetolog_jira_export_{job_id}.json"',
         },
     )
+
+
+@app.post("/jobs/{job_id}/cancel", response_model=JobResponse)
+async def cancel_job(
+    job_id: UUID,
+    queue: JobQueueDep,
+    job_store: JobStoreDep,
+):
+    """
+    Cancel a queued or in-progress transcription job.
+
+    The endpoint is safe to call from a browser ``beforeunload`` handler
+    via ``navigator.sendBeacon`` (POST with an empty body) as well as
+    from an explicit user action.  It is idempotent: calling it on a job
+    that is already ``cancelled`` returns HTTP 200 without side effects.
+
+    State machine
+    -------------
+    * ``pending`` / any active stage → ``cancelled`` (atomic UPDATE).
+    * ``cancelled`` → 200 (already cancelled, no change).
+    * ``completed`` / ``failed`` → 409 Conflict.
+    * Not found → 404.
+
+    The worker polls the database status at every chunk boundary.  When
+    it reads ``cancelled`` it aborts processing, purges its ``/tmp``
+    working directory, and exits the job cleanly without marking it as
+    ``failed``.
+    """
+    try:
+        previous_status = await queue.cancel_job(job_id)
+    except ValueError as exc:
+        # Job is in a terminal state (completed or failed).
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    if previous_status is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Return the current job record so the caller can update its local state
+    # immediately without waiting for the next polling cycle.
+    job = await job_store.load(job_id)
+    if job is None:
+        # Extremely unlikely: the row vanished between cancel and load.
+        raise HTTPException(status_code=404, detail="Job not found after cancellation")
+
+    logger.info(
+        "job_cancel_requested",
+        job_id=str(job_id),
+        previous_status=previous_status,
+    )
+    return job
 
 
 @app.get("/health")

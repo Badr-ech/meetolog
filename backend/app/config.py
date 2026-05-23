@@ -184,6 +184,24 @@ class Settings(BaseSettings):
         description="Async PostgreSQL connection URL (postgresql+asyncpg://...)"
     )
 
+    # ECS worker auto-scaling
+    ecs_cluster: str = Field(
+        default="meetolog-cluster",
+        description="ECS cluster name used for worker auto-scaling",
+    )
+    ecs_worker_service: str = Field(
+        default="meetolog-worker-svc",
+        description="ECS service name for the background worker",
+    )
+    worker_idle_shutdown_polls: int = Field(
+        default=6,
+        ge=1,
+        description=(
+            "Consecutive empty queue polls before the worker scales itself to 0. "
+            "Each poll is 5 s apart, so the default of 6 gives a 30 s idle window."
+        ),
+    )
+
     @field_validator("database_url", mode="after")
     @classmethod
     def normalize_database_url(cls, v: str) -> str:

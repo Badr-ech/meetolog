@@ -14,7 +14,8 @@ export type JobStatus =
   | "extracting"
   | "generating_pdf"
   | "completed"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 /** Metadata for a single progress stage shown in the UI. */
 export interface StageInfo {
@@ -37,6 +38,7 @@ export const PROGRESS_MAPPING: Record<string, StageInfo> = {
   generating_pdf: { label: "Generating PDF…", pct: 75 },
   completed: { label: "Processing Complete!", pct: 100 },
   failed: { label: "Processing Failed", pct: 0 },
+  cancelled: { label: "Processing Cancelled", pct: 0 },
   // Legacy fallbacks for cached jobs written before v1.1
   pending: { label: "Uploading Audio…", pct: 10 },
   processing: { label: "Processing…", pct: 25 },

@@ -220,6 +220,105 @@ class PostgresJobQueue:
             logger.exception("Failed to mark job %s as failed", job_id)
             raise
 
+    async def fetch_job_status(self, job_id: uuid.UUID) -> str | None:
+        """Return the current status string for *job_id*.
+
+        Returns ``None`` if no row with that ID exists.  This is a
+        lightweight read used by the worker's cancellation polling loop —
+        it intentionally avoids the ``FOR UPDATE`` lock so it never
+        contends with the queue-claim query on concurrent workers.
+        """
+        try:
+            result = await self._session.execute(
+                select(JobRecord.status).where(JobRecord.id == job_id)
+            )
+            row = result.one_or_none()
+            return row[0] if row is not None else None
+        except SQLAlchemyError:
+            await self._session.rollback()
+            logger.exception("Failed to fetch status for job %s", job_id)
+            raise
+
+    async def cancel_job(self, job_id: uuid.UUID) -> str | None:
+        """Atomically transition a job to ``cancelled`` status.
+
+        Behaviour by current status
+        ---------------------------
+        * ``pending`` / ``processing`` / any in-flight stage — transitions
+          to ``cancelled``, clears the worker lock, and records the
+          cancellation timestamp.
+        * ``cancelled`` — no-op; returns the existing status (idempotent).
+        * ``completed`` / ``failed`` — raises ``ValueError``.  Terminal jobs
+          cannot be cancelled.
+        * Not found — returns ``None``.
+
+        The UPDATE is guarded by ``WHERE status NOT IN ('completed', 'failed')``
+        so a concurrent worker that races to complete the job between the
+        caller's status read and the UPDATE cannot be silently overwritten.
+        If the UPDATE matches zero rows and the row exists, it means the job
+        raced to a terminal state; the caller receives a ``ValueError``.
+
+        Returns
+        -------
+        str | None
+            The status string that was in place *before* cancellation, or
+            ``None`` if the job was not found.
+        """
+        now = datetime.now(timezone.utc)
+
+        # Read the current status first so we can give a precise error message.
+        try:
+            result = await self._session.execute(
+                select(JobRecord.status).where(JobRecord.id == job_id)
+            )
+            row = result.one_or_none()
+        except SQLAlchemyError:
+            await self._session.rollback()
+            logger.exception("Failed to read status before cancelling job %s", job_id)
+            raise
+
+        if row is None:
+            return None
+
+        previous_status: str = row[0]
+
+        if previous_status in ("completed", "failed"):
+            raise ValueError(
+                f"Cannot cancel job {job_id}: already in terminal state '{previous_status}'"
+            )
+
+        if previous_status == "cancelled":
+            # Idempotent — nothing to do.
+            return previous_status
+
+        # Atomically transition.  The WHERE clause prevents clobbering a job
+        # that raced to ``completed`` or ``failed`` between our SELECT above
+        # and this UPDATE (narrow but real TOCTOU window under high load).
+        try:
+            await self._session.execute(
+                update(JobRecord)
+                .where(
+                    JobRecord.id == job_id,
+                    JobRecord.status.not_in(["completed", "failed"]),
+                )
+                .values(
+                    status="cancelled",
+                    cancelled_at=now,
+                    locked_at=None,
+                    locked_by=None,
+                    message="Processing cancelled by user",
+                    updated_at=now,
+                )
+            )
+            await self._session.commit()
+        except SQLAlchemyError:
+            await self._session.rollback()
+            logger.exception("Failed to cancel job %s", job_id)
+            raise
+
+        logger.info("job_cancelled", job_id=str(job_id), previous_status=previous_status)
+        return previous_status
+
     async def update_job_progress(
         self,
         job_id: uuid.UUID,

@@ -242,6 +242,12 @@ class ProcessingStatus(str, Enum):
     Legacy values ``"pending"`` and ``"processing"`` are accepted on
     read via :func:`parse_processing_status` but should not be written
     by new code.
+
+    Terminal states
+    ---------------
+    ``COMPLETED`` and ``FAILED`` are irreversible terminal states.
+    ``CANCELLED`` is a user-initiated terminal state — once a job is
+    cancelled it cannot transition to any other state.
     """
     UPLOADING = "uploading"
     DIARIZING = "diarizing"
@@ -250,6 +256,7 @@ class ProcessingStatus(str, Enum):
     GENERATING_PDF = "generating_pdf"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 # Backward-compatibility mapping for status values written by pre-v1.1 jobs.
@@ -257,6 +264,14 @@ _LEGACY_STATUS_MAP: dict[str, ProcessingStatus] = {
     "pending": ProcessingStatus.UPLOADING,
     "processing": ProcessingStatus.TRANSCRIBING,
 }
+
+# Status values from which a job can never be cancelled.
+TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
+
+# Status values from which a job may be cancelled (including idempotent re-cancel).
+CANCELLABLE_STATUSES: frozenset[str] = frozenset(
+    {"pending", "uploading", "diarizing", "transcribing", "extracting", "generating_pdf"}
+)
 
 
 def parse_processing_status(value: str) -> ProcessingStatus:

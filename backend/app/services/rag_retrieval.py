@@ -9,11 +9,20 @@ automatically when the worker's ``TemporaryDirectory`` context exits.
 
 Embedding Provider Selection
 ----------------------------
-* ``LLM_PROVIDER=gemini``  → Google ``text-embedding-004``
+* ``LLM_PROVIDER=gemini``  → Google ``models/embedding-001``
 * ``LLM_PROVIDER=openai``  → OpenAI ``text-embedding-3-small``
 
 Both providers are accessed through the same async interface so the
 rest of the pipeline is provider-agnostic.
+
+Fallback Behaviour
+------------------
+If the embedding API call fails (e.g. model not found, quota exceeded,
+network error), ``build_index`` catches the exception, logs a warning,
+and returns a :class:`TranscriptIndex` in *degraded mode*.  In degraded
+mode ``retrieve`` skips cosine similarity and instead returns the first
+``top_k`` chunks in document order, so downstream artifact generation
+still receives some context rather than crashing the entire worker thread.
 """
 
 from __future__ import annotations
@@ -90,21 +99,43 @@ async def _embed_openai(texts: list[str], api_key: str) -> np.ndarray:
 
 
 async def _embed_gemini(texts: list[str], api_key: str) -> np.ndarray:
-    """Generate embeddings via Google ``text-embedding-004``."""
+    """Generate embeddings via Google ``models/embedding-001``.
+
+    ``text-embedding-004`` requires the v1 REST endpoint, but the legacy
+    ``google-generativeai`` SDK targets v1beta by default, which only
+    exposes ``embedding-001``.  Using ``text-embedding-004`` against v1beta
+    raises ``google.api_core.exceptions.NotFound: 404 models/text-embedding-004
+    is not found for API version v1beta``.
+
+    Batch handling note
+    -------------------
+    The legacy SDK's ``embed_content`` returns different shapes depending on
+    whether ``content`` is a ``str`` or a ``list[str]``:
+
+    * ``str``       → ``{"embedding": [float, float, ...]}``
+    * ``list[str]`` → ``{"embedding": [[float, ...], [float, ...], ...]}``
+
+    We always pass a list (even if it has one element) and assert the nested
+    shape here so failures surface immediately with a clear error.
+    """
     import google.generativeai as genai
 
     genai.configure(api_key=api_key)
 
     def _call() -> list[list[float]]:
         result = genai.embed_content(
-            model="models/text-embedding-004",
-            content=texts,
+            model="models/embedding-001",
+            content=texts,  # list[str] → batch embedding
             task_type="RETRIEVAL_DOCUMENT",
         )
-        return result["embedding"]
+        raw = result["embedding"]
+        # Normalise: SDK returns list[list[float]] for list input.
+        if raw and not isinstance(raw[0], list):
+            # Single-item batch collapsed to a flat list — re-wrap it.
+            raw = [raw]
+        return raw
 
     vectors = await asyncio.to_thread(_call)
-    # Gemini returns list[list[float]] when given a list input.
     return np.array(vectors, dtype=np.float32)
 
 
@@ -159,10 +190,18 @@ class TranscriptIndex:
     cosine-similarity retrieval.  Intended to be constructed via
     :func:`build_index` and discarded when the enclosing temp directory
     is garbage-collected.
+
+    Degraded mode
+    -------------
+    When ``degraded=True`` the index has no usable vectors (embedding
+    failed at build time).  ``retrieve`` skips cosine similarity and
+    returns the first *top_k* chunks in document order so downstream
+    artifact generation always receives some context.
     """
 
     chunks: list[str] = field(default_factory=list)
     vectors: np.ndarray = field(default_factory=lambda: np.empty((0, 0), dtype=np.float32))
+    degraded: bool = False  # True when embedding failed; falls back to positional retrieval
 
     # ── retrieval ─────────────────────────────────────────────────
 
@@ -187,9 +226,21 @@ class TranscriptIndex:
             settings = get_settings()
         if top_k is None:
             top_k = settings.rag_top_k
-        if self.vectors.size == 0:
-            return []
 
+        # ── degraded-mode fallback: no vectors available ──────────
+        if self.degraded or self.vectors.size == 0:
+            # Return chunks spread across the transcript so we capture
+            # opening context, mid-meeting content, and closing items
+            # rather than just the first N chunks.
+            if not self.chunks:
+                return []
+            k = min(top_k, len(self.chunks))
+            if k >= len(self.chunks):
+                return list(self.chunks)
+            step = max(1, len(self.chunks) // k)
+            return [self.chunks[i * step] for i in range(k)]
+
+        # ── normal path: cosine similarity ───────────────────────
         query_vec = await _embed_texts([query], settings, task_type="query")
         # Cosine similarity: dot(a, b) / (||a|| * ||b||)
         norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
@@ -269,7 +320,34 @@ async def build_index(
         total_tokens=count_tokens(transcript),
         backend="memory",
     )
-    vectors = await _embed_texts(chunks, settings, task_type="document")
+
+    # ── Embedding with graceful fallback ──────────────────────────
+    # Catch model-not-found errors (e.g. wrong API version, unsupported
+    # model string) and general embedding failures so that a transient
+    # API misconfiguration never aborts a multi-hour transcription job.
+    try:
+        vectors = await _embed_texts(chunks, settings, task_type="document")
+    except Exception as exc:  # noqa: BLE001
+        # Attempt a structured import of the specific Google exception so we
+        # can log the class name precisely even if the package is unavailable.
+        try:
+            from google.api_core.exceptions import GoogleAPIError  # noqa: F401
+        except ImportError:
+            pass
+
+        logger.warning(
+            "rag_embedding_failed_degraded_mode",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            num_chunks=len(chunks),
+            hint=(
+                "Falling back to positional retrieval.  If this is a Gemini "
+                "'404 model not found' error, verify that GEMINI_API_KEY has "
+                "access to 'models/embedding-001' via the v1beta endpoint."
+            ),
+        )
+        return TranscriptIndex(chunks=chunks, degraded=True)
+
     logger.info(
         "rag_build_index_done",
         num_chunks=len(chunks),
