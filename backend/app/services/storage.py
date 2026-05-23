@@ -264,6 +264,24 @@ class S3StorageService:
             await s3.delete_object(Bucket=self._bucket, Key=object_key)
         logger.info("Deleted s3://%s/%s", self._bucket, object_key)
 
+    async def upload_file(self, file_path: str, object_key: str) -> str:
+        """Upload a local file to an explicit S3 key.
+
+        Used by the splitter to store audio chunks before chunk workers
+        download them.
+
+        Args:
+            file_path:  Local path to the file.
+            object_key: Destination key in the configured S3 bucket.
+
+        Returns:
+            The S3 object key.
+        """
+        async with self._client_ctx() as s3:
+            await s3.upload_file(file_path, self._bucket, object_key)
+        logger.info("Uploaded %s to s3://%s/%s", file_path, self._bucket, object_key)
+        return object_key
+
     @retry(
         retry=retry_if_exception_type(_RETRYABLE),
         stop=stop_after_attempt(4),

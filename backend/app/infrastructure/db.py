@@ -77,7 +77,7 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Create all tables. Call once at application startup."""
     from ..models.metadata import FileMetadata  # noqa: F401
-    from ..models.db_models import JobRecord  # noqa: F401
+    from ..models.db_models import JobRecord, JobChunk  # noqa: F401
 
     engine = _get_engine()
     async with engine.begin() as conn:

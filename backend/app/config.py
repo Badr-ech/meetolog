@@ -190,8 +190,26 @@ class Settings(BaseSettings):
         description="ECS cluster name used for worker auto-scaling",
     )
     ecs_worker_service: str = Field(
-        default="meetolog-worker-svc",
-        description="ECS service name for the background worker",
+        default="meetolog-worker",
+        description="ECS service name for the background worker / splitter",
+    )
+    ecs_worker_task_definition: str = Field(
+        default="meetolog-worker",
+        description=(
+            "ECS task definition family name used when launching chunk-worker "
+            "and assembler RunTask calls.  Usually the same as the worker service "
+            "task definition."
+        ),
+    )
+    max_parallel_chunks: int = Field(
+        default=6,
+        ge=1,
+        le=24,
+        description=(
+            "Maximum number of chunk-worker Fargate tasks launched per job. "
+            "Each uses 0.5 vCPU, so 6 workers consume 3 vCPUs — well within the "
+            "default Fargate 6-vCPU account limit alongside the API and splitter."
+        ),
     )
     worker_idle_shutdown_polls: int = Field(
         default=6,

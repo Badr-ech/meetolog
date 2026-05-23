@@ -250,8 +250,10 @@ class ProcessingStatus(str, Enum):
     cancelled it cannot transition to any other state.
     """
     UPLOADING = "uploading"
+    SPLITTING = "splitting"
     DIARIZING = "diarizing"
     TRANSCRIBING = "transcribing"
+    ASSEMBLING = "assembling"
     EXTRACTING = "extracting"
     GENERATING_PDF = "generating_pdf"
     COMPLETED = "completed"
@@ -270,7 +272,10 @@ TERMINAL_STATUSES: frozenset[str] = frozenset({"completed", "failed"})
 
 # Status values from which a job may be cancelled (including idempotent re-cancel).
 CANCELLABLE_STATUSES: frozenset[str] = frozenset(
-    {"pending", "uploading", "diarizing", "transcribing", "extracting", "generating_pdf"}
+    {
+        "pending", "uploading", "splitting", "diarizing",
+        "transcribing", "assembling", "extracting", "generating_pdf",
+    }
 )
 
 

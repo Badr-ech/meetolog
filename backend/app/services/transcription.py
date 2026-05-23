@@ -6,7 +6,12 @@ memory-safe chunked pipeline:
 - Audio is split into fixed-duration chunks via ``ffmpeg``
   (see :mod:`app.utils.audio`)
 - The Whisper model is loaded **once** per process and cached
-- Each chunk is transcribed **sequentially** (no parallelism)
+- Language is detected on the first chunk and passed explicitly to all
+  subsequent chunks.  This prevents Whisper from re-running its 30-second
+  language probe on every chunk, which was the root cause of jobs stalling
+  on later chunks when the audio contained silence or ambiguous audio.
+- Each chunk is transcribed sequentially (single-process path) or one per
+  process (parallel-worker path via :meth:`transcribe_single_chunk`)
 - ``gc.collect()`` is called after every chunk to reclaim memory
 - Chunk files are deleted from disk immediately after transcription
 - A caller-supplied ``progress_callback`` enables granular progress
@@ -88,8 +93,9 @@ class WhisperTranscriber(Transcriber):
     Chunked Whisper transcriber with memory-safe processing.
 
     Splits audio into fixed-duration chunks, transcribes each sequentially,
-    and merges the results.  A ``gc.collect()`` call after every chunk
-    prevents memory bloat during long recordings.
+    and merges the results.  Language is detected once on the first chunk
+    and reused for all subsequent chunks.  A ``gc.collect()`` call after
+    every chunk prevents memory bloat during long recordings.
     """
 
     def __init__(
@@ -107,29 +113,45 @@ class WhisperTranscriber(Transcriber):
     def _load_model(self):
         return _get_cached_model(self._model_name)
 
-    def _transcribe_sync(self, audio_path: Path) -> str:
+    def _transcribe_sync(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+    ) -> tuple[str, str]:
+        """Transcribe *audio_path* and return ``(text, detected_language)``.
+
+        When *language* is ``None`` Whisper probes the first 30 seconds to
+        detect it automatically.  Pass the result of the first chunk back in
+        for all subsequent chunks to skip re-detection and prevent stalls on
+        audio segments that are ambiguous (silence, music, etc.).
+        """
         model = self._load_model()
 
-        logger.info(f"Transcribing audio file: {audio_path}")
         result = model.transcribe(
             str(audio_path),
-            language=None,   # Auto-detect language
+            language=language,
             verbose=False,
         )
 
-        transcript = result.get("text", "").strip()
-        detected_language = result.get("language", "unknown")
-        logger.info(f"Transcription complete. Detected language: {detected_language}")
+        text = result.get("text", "").strip()
+        detected = result.get("language", "unknown")
+        logger.info(
+            "Transcription complete. language=%s (requested=%s)",
+            detected, language or "auto",
+        )
+        return text, detected
 
-        return transcript
-
-    def _transcribe_segments_sync(self, audio_path: Path) -> list[TranscriptSegment]:
-        """Transcribe and return timestamped segments (blocking)."""
+    def _transcribe_segments_sync(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+    ) -> tuple[list[TranscriptSegment], str]:
+        """Transcribe and return ``(segments, detected_language)`` (blocking)."""
         model = self._load_model()
 
         result = model.transcribe(
             str(audio_path),
-            language=None,
+            language=language,
             verbose=False,
         )
 
@@ -142,7 +164,7 @@ class WhisperTranscriber(Transcriber):
                     end=seg["end"],
                     text=text,
                 ))
-        return segments
+        return segments, result.get("language", "unknown")
 
     # ------------------------------------------------------------------
     # Public API
@@ -155,22 +177,14 @@ class WhisperTranscriber(Transcriber):
     ) -> str:
         """Transcribe an audio file using chunked processing.
 
-        Pipeline:
-            1. Split audio into ``chunk_duration_sec``-second WAV chunks
-               via ffmpeg (disk I/O only, nothing held in RAM).
-            2. Load the Whisper model **once** (cached across calls).
-            3. For each chunk:
-               a. Transcribe (offloaded to the thread pool).
-               b. Delete the chunk file from disk immediately.
-               c. ``del`` the result dict and call ``gc.collect()``.
-               d. Invoke *progress_callback* if provided.
-            4. Return the concatenated transcript.
+        Language is detected from the first chunk and reused for all
+        subsequent chunks, avoiding per-chunk re-detection overhead and
+        preventing stalls on ambiguous audio later in the recording.
 
         Args:
             audio_path: Path to the source audio file.
             progress_callback: Optional async callable ``(chunk_index, total_chunks)``
-                invoked after each chunk completes.  Used by the worker to write
-                per-chunk progress to PostgreSQL.
+                invoked after each chunk completes.
 
         Raises:
             FileNotFoundError: If *audio_path* does not exist.
@@ -198,15 +212,22 @@ class WhisperTranscriber(Transcriber):
             )
 
             transcripts: list[str] = []
+            detected_language: str | None = None
 
             for i, chunk_path in enumerate(chunks):
-                chunk_text = await asyncio.to_thread(
-                    self._transcribe_sync, chunk_path,
+                chunk_text, lang = await asyncio.to_thread(
+                    self._transcribe_sync,
+                    chunk_path,
+                    detected_language,  # None on first chunk → auto-detect
                 )
+                # Lock in the detected language after the first chunk.
+                if detected_language is None:
+                    detected_language = lang
+                    logger.info("Language locked to '%s' for remaining chunks", lang)
+
                 chunk_text = self._clean_text(chunk_text)
                 transcripts.append(chunk_text)
 
-                # Free disk space for this chunk immediately
                 try:
                     os.remove(chunk_path)
                 except OSError:
@@ -217,11 +238,9 @@ class WhisperTranscriber(Transcriber):
                     i + 1, total_chunks, len(chunk_text),
                 )
 
-                # Notify via the 2-arg callback
                 if progress_callback is not None:
                     await progress_callback(i, total_chunks)
 
-                # Reclaim memory aggressively
                 del chunk_text
                 gc.collect()
 
@@ -247,12 +266,34 @@ class WhisperTranscriber(Transcriber):
             shutil.rmtree(chunk_dir, ignore_errors=True)
             logger.debug("Cleaned up chunk directory: %s", chunk_dir)
 
-    async def transcribe_chunk(self, chunk_path: Path) -> str:
-        """Transcribe a single audio chunk (kept for backward compatibility)."""
+    async def transcribe_single_chunk(
+        self,
+        chunk_path: Path,
+        language: str | None = None,
+    ) -> tuple[str, str]:
+        """Transcribe a single pre-split chunk file.
+
+        Used by the parallel ``chunk_worker`` Fargate tasks, each of which
+        handles one audio segment from S3.  Returns ``(text, detected_language)``
+        so the worker can persist the detected language alongside the transcript.
+
+        Args:
+            chunk_path: Path to the chunk WAV file.
+            language:   ISO 639-1 code to pass to Whisper.  ``None`` triggers
+                        automatic detection (used when the splitter could not
+                        probe the language beforehand).
+
+        Raises:
+            FileNotFoundError: If *chunk_path* does not exist.
+            RuntimeError: If Whisper fails.
+        """
         if not chunk_path.exists():
             raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
-        text = await asyncio.to_thread(self._transcribe_sync, chunk_path)
-        return self._clean_text(text)
+
+        text, detected = await asyncio.to_thread(
+            self._transcribe_sync, chunk_path, language
+        )
+        return self._clean_text(text), detected
 
     async def transcribe_with_segments(
         self,
@@ -261,16 +302,14 @@ class WhisperTranscriber(Transcriber):
     ) -> tuple[str, list[TranscriptSegment]]:
         """Transcribe audio and return both text and globally-timestamped segments.
 
-        Identical to :meth:`transcribe` in chunking strategy, but each
-        chunk's Whisper segments are collected with their timestamps
-        offset to the global recording timeline.  This data is required
-        by the diarization alignment step.
+        Language is detected on the first chunk and locked in for the rest,
+        matching the behaviour of :meth:`transcribe`.
 
         Returns
         -------
         tuple[str, list[TranscriptSegment]]
-            *(full_transcript, segments)* — the concatenated text plus
-            a chronological list of timestamped segments.
+            *(full_transcript, segments)* — concatenated text plus a
+            chronological list of timestamped segments.
         """
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -294,13 +333,20 @@ class WhisperTranscriber(Transcriber):
 
             all_segments: list[TranscriptSegment] = []
             transcripts: list[str] = []
+            detected_language: str | None = None
 
             for i, chunk_path in enumerate(chunks):
                 chunk_offset = i * self._chunk_duration_sec
 
-                chunk_segments = await asyncio.to_thread(
-                    self._transcribe_segments_sync, chunk_path,
+                chunk_segments, lang = await asyncio.to_thread(
+                    self._transcribe_segments_sync,
+                    chunk_path,
+                    detected_language,
                 )
+
+                if detected_language is None:
+                    detected_language = lang
+                    logger.info("Language locked to '%s' for remaining chunks", lang)
 
                 for seg in chunk_segments:
                     seg.start += chunk_offset

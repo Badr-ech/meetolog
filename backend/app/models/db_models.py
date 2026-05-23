@@ -1,9 +1,9 @@
-"""SQLAlchemy ORM model for job tracking in PostgreSQL."""
+"""SQLAlchemy ORM models for job tracking in PostgreSQL."""
 
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Index, Integer, String, Text, Uuid
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, Uuid
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,6 +45,9 @@ class JobRecord(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True,
     )
+    detected_language: Mapped[str | None] = mapped_column(
+        String(10), nullable=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -65,4 +68,53 @@ class JobRecord(Base):
             "next_retry_at",
             "created_at",
         ),
+    )
+
+
+class JobChunk(Base):
+    """One 5-minute audio segment belonging to a parent :class:`JobRecord`.
+
+    The parallel transcription pipeline splits each uploaded recording into
+    fixed-duration chunks and stores one row here per chunk.  Multiple
+    ``chunk_worker`` Fargate tasks claim rows concurrently via
+    ``SELECT … FOR UPDATE SKIP LOCKED``, transcribe their audio segment,
+    and write the result back.  When the last worker marks its chunk
+    ``completed`` it transitions the parent job to ``assembling``.
+    """
+
+    __tablename__ = "job_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), primary_key=True, default=uuid.uuid4,
+    )
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(),
+        ForeignKey("job_records.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    audio_s3_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="pending",
+    )
+    transcript: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Language detected while transcribing this chunk (ISO 639-1, e.g. "en").
+    detected_language: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    locked_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("ix_job_chunks_queue_poll", "job_id", "status", "created_at"),
     )

@@ -18,7 +18,15 @@ echo "Meetolog – starting service: ${SERVICE_TYPE}"
 
 case "${SERVICE_TYPE}" in
     web)
-        echo "Running database migrations..."
+        echo "Checking database migration state..."
+        # If the alembic_version table is empty or missing, the database was
+        # created before Alembic tracking began.  Stamp it at the last known
+        # baseline so 'upgrade head' only applies new migrations.
+        if ! alembic --config /app/alembic.ini current 2>/dev/null | grep -q '[a-f0-9]'; then
+            echo "No migration history found — stamping baseline at c7d9e1f3a5b2"
+            alembic --config /app/alembic.ini stamp c7d9e1f3a5b2
+        fi
+        echo "Applying pending migrations..."
         alembic --config /app/alembic.ini upgrade head
         echo "Migrations complete. Starting API server..."
         exec uvicorn app.main:app \
@@ -27,7 +35,13 @@ case "${SERVICE_TYPE}" in
             --workers 1 \
             --log-level info
         ;;
-    worker)
+    worker|splitter)
+        exec python -m app.worker
+        ;;
+    chunk_worker)
+        exec python -m app.worker
+        ;;
+    assembler)
         exec python -m app.worker
         ;;
     *)
