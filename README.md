@@ -34,19 +34,9 @@ Meetolog accepts audio uploads or in-browser recordings, identifies speakers via
 
 The backend runs on **AWS ECS Fargate**. All three worker roles share a single Docker image; `SERVICE_TYPE` selects the role at runtime. The frontend is deployed to Vercel.
 
-### Worker pipeline (adaptive parallel transcription)
+### Worker pipeline (parallel transcription)
 
-When a job is enqueued the worker service acts as a **splitter**: it downloads the audio, cuts it into 5-minute chunks with ffmpeg, uploads each chunk to S3, and launches ephemeral **chunk-worker** tasks via `ecs:RunTask`. Each chunk worker claims chunks from the `job_chunks` queue with `SELECT … FOR UPDATE SKIP LOCKED`, transcribes with Whisper, and exits when no chunks remain. The last worker transitions the job to `assembling` and launches a single **assembler** task, which joins the transcripts, runs LLM extraction, generates the PDF, and marks the job `completed`.
-
-**Parallel vs. sequential threshold** — the two ECS RunTask cold-starts add a fixed ~90 s overhead to every job. Benchmarking shows this overhead exceeds the transcription time saved by parallelism for short meetings:
-
-| Chunks (N) | Meeting ≈ | Workers launched | Expected saving |
-|-----------|-----------|-----------------|-----------------|
-| ≤ 5 | ≤ 25 min | 1 (sequential) | break-even or negative |
-| 6–8 | 30–40 min | 1 (sequential) | saving < LLM API variance |
-| ≥ 9 | ≥ 45 min | min(N, MAX_PARALLEL_CHUNKS) | reliably positive |
-
-Below `PARALLEL_MIN_CHUNKS` (default 9) the splitter launches a single chunk worker so chunks are transcribed sequentially — same infrastructure, no parallel overhead. At 9 chunks the parallelism saves ~64 s; at 18 chunks it saves ~4 minutes.
+When a job is enqueued the worker service acts as a **splitter**: it downloads the audio, cuts it into 5-minute chunks with ffmpeg, uploads each chunk to S3, and fires up to `MAX_PARALLEL_CHUNKS` (default 6) ephemeral **chunk-worker** tasks via `ecs:RunTask`. Each chunk worker claims chunks from the `job_chunks` queue with `SELECT … FOR UPDATE SKIP LOCKED`, transcribes with Whisper, and exits when no chunks remain. The last worker transitions the job to `assembling` and launches a single **assembler** task, which joins the transcripts, runs LLM extraction, generates the PDF, and marks the job `completed`.
 
 ```
 Job enqueued
@@ -77,7 +67,7 @@ Job enqueued
                                └─────────────────┘
 ```
 
-A 90-minute meeting (18 × 5-minute chunks) with 6 parallel workers completes transcription in roughly the time of 3 sequential chunks — about a 6× speedup at the same total compute cost. For meetings under ~45 minutes (fewer than 9 chunks) the splitter uses a single worker to avoid overhead exceeding the parallelism gain.
+A 90-minute meeting (18 × 5-minute chunks) with 6 parallel workers completes transcription in roughly the time of 3 sequential chunks — about a 6× speedup at the same total compute cost.
 
 Language is detected from the first chunk by the splitter and passed to all chunk workers via an env-var override in the `RunTask` call, preventing Whisper from re-running its 30-second language probe on every segment.
 
@@ -788,7 +778,6 @@ All variables are loaded via Pydantic Settings from environment variables (or `.
 | `ECS_WORKER_SERVICE` | `meetolog-worker-svc` | ECS service name for the splitter (scales to 0 when idle) |
 | `ECS_WORKER_TASK_DEFINITION` | `meetolog-worker` | Task definition used when launching chunk workers and assembler via RunTask |
 | `MAX_PARALLEL_CHUNKS` | `6` | Max simultaneous chunk-worker tasks per job (0.5 vCPU × N, default fits within 6 vCPU Fargate limit) |
-| `PARALLEL_MIN_CHUNKS` | `9` | Minimum chunk count to enable parallel transcription. Below this threshold a single chunk worker is used — the ~90 s ECS cold-start overhead exceeds parallelism savings for short meetings. |
 | `WORKER_IDLE_SHUTDOWN_POLLS` | `6` | Consecutive empty polls before the splitter scales itself to 0 (5 s each → 30 s idle window) |
 
 The frontend reads:

@@ -230,15 +230,8 @@ async def _run_splitter_job(
             message=f"Transcribing {total_chunks} chunk(s) in parallel…",
         )
 
-        # Launch chunk workers.  For short meetings the ECS RunTask cold-start
-        # overhead (~90 s total) exceeds the transcription time saved by running
-        # workers in parallel.  Benchmarks show break-even at ~5 chunks and a
-        # reliable saving only from ~9 chunks onward, so below parallel_min_chunks
-        # we use a single worker (sequential transcription, same infrastructure).
-        if total_chunks >= settings.parallel_min_chunks:
-            num_workers = min(total_chunks, settings.max_parallel_chunks)
-        else:
-            num_workers = 1
+        # Launch parallel chunk workers (up to max_parallel_chunks).
+        num_workers = min(total_chunks, settings.max_parallel_chunks)
         await run_chunk_workers(
             cluster=settings.ecs_cluster,
             service=settings.ecs_worker_service,

@@ -211,18 +211,6 @@ class Settings(BaseSettings):
             "default Fargate 6-vCPU account limit alongside the API and splitter."
         ),
     )
-    parallel_min_chunks: int = Field(
-        default=9,
-        ge=1,
-        description=(
-            "Minimum number of chunks required to enable parallel transcription. "
-            "Below this threshold a single chunk worker is used instead. "
-            "Benchmarks show the two ECS RunTask cold-starts add ~90 s of fixed "
-            "overhead; at 9 chunks the parallelism savings (~64 s) reliably exceed "
-            "LLM API variance. For meetings shorter than ~45 minutes (< 9 chunks) "
-            "sequential transcription is faster end-to-end."
-        ),
-    )
     worker_idle_shutdown_polls: int = Field(
         default=6,
         ge=1,
