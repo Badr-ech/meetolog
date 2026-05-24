@@ -162,8 +162,32 @@ class ChunkQueue:
             raise
 
     # ------------------------------------------------------------------
-    # Read path (assembler)
+    # Read path (assembler + progress tracking)
     # ------------------------------------------------------------------
+
+    async def count_completed_chunks(
+        self, job_id: uuid.UUID
+    ) -> tuple[int, int]:
+        """Return ``(completed_count, total_count)`` for *job_id*'s chunks.
+
+        Used by chunk workers to emit proportional progress updates on the
+        parent job record as each chunk finishes.
+        """
+        try:
+            result = await self._session.execute(
+                select(
+                    func.count().filter(JobChunk.status == "completed"),
+                    func.count(),
+                )
+                .select_from(JobChunk)
+                .where(JobChunk.job_id == job_id)
+            )
+            row = result.one()
+            return int(row[0]), int(row[1])
+        except SQLAlchemyError:
+            await self._session.rollback()
+            logger.exception("Failed to count chunks for job %s", job_id)
+            raise
 
     async def get_completed_transcripts(
         self, job_id: uuid.UUID

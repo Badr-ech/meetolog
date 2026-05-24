@@ -266,6 +266,38 @@ class WhisperTranscriber(Transcriber):
             shutil.rmtree(chunk_dir, ignore_errors=True)
             logger.debug("Cleaned up chunk directory: %s", chunk_dir)
 
+    async def detect_language_only(self, audio_path: Path) -> str:
+        """Probe the first 30 seconds of audio to identify its language.
+
+        Takes ~2 seconds instead of several minutes — uses Whisper's built-in
+        ``detect_language()`` which processes only a single 30-second mel
+        spectrogram rather than running a full transcription.
+
+        Args:
+            audio_path: Path to any audio file Whisper can read.
+
+        Returns:
+            ISO 639-1 language code (e.g. ``"en"``, ``"nl"``).
+
+        Raises:
+            FileNotFoundError: If *audio_path* does not exist.
+        """
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+        def _detect() -> str:
+            whisper_mod = _get_whisper()
+            model = _get_cached_model(self._model_name)
+            audio = whisper_mod.load_audio(str(audio_path))
+            audio = whisper_mod.pad_or_trim(audio)  # first 30 seconds only
+            mel = whisper_mod.log_mel_spectrogram(audio).to(model.device)
+            _, probs = model.detect_language(mel)
+            lang = max(probs, key=probs.get)
+            logger.info("Language detection complete: %s", lang)
+            return lang
+
+        return await asyncio.to_thread(_detect)
+
     async def transcribe_single_chunk(
         self,
         chunk_path: Path,

@@ -173,11 +173,7 @@ async def _run_splitter_job(
                 try:
                     from app.services.transcription import WhisperTranscriber
                     transcriber = WhisperTranscriber(model_name=settings.whisper_model)
-                    _, detected_language = await transcriber.transcribe_single_chunk(
-                        chunks[0], language=None
-                    )
-                    # We only needed the language; discard the transcript here —
-                    # the chunk worker will re-transcribe chunk 0 from S3.
+                    detected_language = await transcriber.detect_language_only(chunks[0])
                     del transcriber
                     gc.collect()
                     job_logger.info("language_detected", language=detected_language)
@@ -477,6 +473,23 @@ async def chunk_worker_main() -> None:
                     duration_seconds=elapsed,
                 )
                 chunks_processed += 1
+
+                # Update parent job progress proportionally as chunks complete.
+                # Maps 10% (splitting done) → 42% (just before assembling at 45%).
+                try:
+                    async with session_factory() as session:
+                        chunk_q = ChunkQueue(session)
+                        done, total = await chunk_q.count_completed_chunks(job_id)
+                    if total > 0:
+                        pct = 10 + int(done / total * 32)
+                        async with session_factory() as session:
+                            queue = PostgresJobQueue(session)
+                            await queue.update_job_progress(job_id, progress=pct)
+                except Exception as progress_exc:
+                    job_logger.warning(
+                        "chunk_progress_update_failed", error=str(progress_exc)
+                    )
+
                 del text
                 gc.collect()
 
