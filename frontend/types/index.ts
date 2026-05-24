@@ -9,8 +9,10 @@
 /** All valid backend processing states. */
 export type JobStatus =
   | "uploading"
+  | "splitting"
   | "diarizing"
   | "transcribing"
+  | "assembling"
   | "extracting"
   | "generating_pdf"
   | "completed"
@@ -31,17 +33,19 @@ export interface StageInfo {
  * from the API when available; `pct` is a fallback.
  */
 export const PROGRESS_MAPPING: Record<string, StageInfo> = {
-  uploading: { label: "Uploading Audio…", pct: 10 },
-  diarizing: { label: "Identifying Speakers…", pct: 15 },
-  transcribing: { label: "Transcribing Audio…", pct: 25 },
-  extracting: { label: "Extracting Artifacts…", pct: 50 },
-  generating_pdf: { label: "Generating PDF…", pct: 75 },
-  completed: { label: "Processing Complete!", pct: 100 },
-  failed: { label: "Processing Failed", pct: 0 },
-  cancelled: { label: "Processing Cancelled", pct: 0 },
-  // Legacy fallbacks for cached jobs written before v1.1
-  pending: { label: "Uploading Audio…", pct: 10 },
-  processing: { label: "Processing…", pct: 25 },
+  uploading:      { label: "Uploading Audio…",             pct: 5  },
+  splitting:      { label: "Splitting Audio into Chunks…", pct: 10 },
+  diarizing:      { label: "Identifying Speakers…",        pct: 15 },
+  transcribing:   { label: "Transcribing…",                 pct: 20 },
+  assembling:     { label: "Assembling Transcript…",       pct: 45 },
+  extracting:     { label: "Extracting Artifacts…",        pct: 50 },
+  generating_pdf: { label: "Generating PDF…",              pct: 75 },
+  completed:      { label: "Processing Complete!",          pct: 100 },
+  failed:         { label: "Processing Failed",             pct: 0  },
+  cancelled:      { label: "Processing Cancelled",          pct: 0  },
+  // Legacy fallbacks for jobs written before v1.1
+  pending:        { label: "Uploading Audio…",             pct: 5  },
+  processing:     { label: "Processing…",                  pct: 25 },
 };
 
 // ---------------------------------------------------------------------------

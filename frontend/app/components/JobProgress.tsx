@@ -9,6 +9,7 @@ const STAGE_ORDER = [
   "uploading",
   "diarizing",
   "transcribing",
+  "assembling",
   "extracting",
   "generating_pdf",
   "completed",
@@ -19,6 +20,7 @@ const STAGE_SHORT_LABELS: Record<string, string> = {
   uploading: "Upload",
   diarizing: "Speakers",
   transcribing: "Transcribe",
+  assembling: "Assemble",
   extracting: "Extract",
   generating_pdf: "PDF",
   completed: "Done",
@@ -40,10 +42,16 @@ export default function JobProgress({ job }: JobProgressProps) {
   const pct = job.progress > 0 ? job.progress : stage.pct;
   const label = job.message || stage.label;
 
+  // "splitting" is a real backend state but too brief for its own dot;
+  // map it to "transcribing" so the Transcribe dot lights up while the
+  // splitter is cutting the audio into chunks.
+  const dotStatus =
+    job.status === "splitting"
+      ? "transcribing"
+      : (job.status as (typeof STAGE_ORDER)[number]);
+
   // Index of the current stage in the ordered list (-1 if not found).
-  const currentIdx = STAGE_ORDER.indexOf(
-    job.status as (typeof STAGE_ORDER)[number],
-  );
+  const currentIdx = STAGE_ORDER.indexOf(dotStatus);
 
   return (
     <div className={`card ${styles.wrapper}`}>

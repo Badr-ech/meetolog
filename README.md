@@ -32,7 +32,54 @@ Meetolog accepts audio uploads or in-browser recordings, identifies speakers via
 
 ## Production Architecture (AWS)
 
-The production backend runs on **AWS ECS Fargate**. The API and workers are deployed as separate ECS services from the same Docker image (selected via `SERVICE_TYPE` env var). The frontend is deployed to Vercel.
+The backend runs on **AWS ECS Fargate**. All three worker roles share a single Docker image; `SERVICE_TYPE` selects the role at runtime. The frontend is deployed to Vercel.
+
+### Worker pipeline (adaptive parallel transcription)
+
+When a job is enqueued the worker service acts as a **splitter**: it downloads the audio, cuts it into 5-minute chunks with ffmpeg, uploads each chunk to S3, and launches ephemeral **chunk-worker** tasks via `ecs:RunTask`. Each chunk worker claims chunks from the `job_chunks` queue with `SELECT … FOR UPDATE SKIP LOCKED`, transcribes with Whisper, and exits when no chunks remain. The last worker transitions the job to `assembling` and launches a single **assembler** task, which joins the transcripts, runs LLM extraction, generates the PDF, and marks the job `completed`.
+
+**Parallel vs. sequential threshold** — the two ECS RunTask cold-starts add a fixed ~90 s overhead to every job. Benchmarking shows this overhead exceeds the transcription time saved by parallelism for short meetings:
+
+| Chunks (N) | Meeting ≈ | Workers launched | Expected saving |
+|-----------|-----------|-----------------|-----------------|
+| ≤ 5 | ≤ 25 min | 1 (sequential) | break-even or negative |
+| 6–8 | 30–40 min | 1 (sequential) | saving < LLM API variance |
+| ≥ 9 | ≥ 45 min | min(N, MAX_PARALLEL_CHUNKS) | reliably positive |
+
+Below `PARALLEL_MIN_CHUNKS` (default 9) the splitter launches a single chunk worker so chunks are transcribed sequentially — same infrastructure, no parallel overhead. At 9 chunks the parallelism saves ~64 s; at 18 chunks it saves ~4 minutes.
+
+```
+Job enqueued
+     │
+     ▼
+┌────────────────────┐   1 vCPU / 4 GB
+│  Splitter          │   (ECS service, scales to 0 when idle)
+│  - split audio     │
+│  - upload chunks   │
+│  - detect language │
+└────────┬───────────┘
+         │  ecs:RunTask × N  (up to MAX_PARALLEL_CHUNKS)
+         │
+    ┌────┴───────────────────────────────┐
+    ▼          ▼                         ▼
+┌──────────┐ ┌──────────┐   …   ┌──────────────┐   0.5 vCPU / 2 GB each
+│ Chunk    │ │ Chunk    │       │ Chunk worker │   (ephemeral RunTask)
+│ worker 1 │ │ worker 2 │       │ worker N     │
+│ chunk 0  │ │ chunk 1  │       │ …            │
+└──────────┘ └──────────┘       └──────┬───────┘
+                                        │ last worker wins CAS
+                                        ▼
+                               ┌─────────────────┐   1 vCPU / 4 GB
+                               │   Assembler      │   (ephemeral RunTask)
+                               │ - join transcripts│
+                               │ - LLM extraction  │
+                               │ - PDF + S3        │
+                               └─────────────────┘
+```
+
+A 90-minute meeting (18 × 5-minute chunks) with 6 parallel workers completes transcription in roughly the time of 3 sequential chunks — about a 6× speedup at the same total compute cost. For meetings under ~45 minutes (fewer than 9 chunks) the splitter uses a single worker to avoid overhead exceeding the parallelism gain.
+
+Language is detected from the first chunk by the splitter and passed to all chunk workers via an env-var override in the `RunTask` call, preventing Whisper from re-running its 30-second language probe on every segment.
 
 ```
                         ┌──────────────┐
@@ -49,40 +96,34 @@ The production backend runs on **AWS ECS Fargate**. The API and workers are depl
           │                    │                     │
   ┌───────▼────────┐  ┌───────▼────────┐   ┌───────▼────────┐
   │ ECS Task (API)  │  │ ECS Task (API)  │   │   S3 Bucket    │
-  │ 0.25 vCPU       │  │ 0.25 vCPU       │   │  (presigned    │
-  │ 512 MB RAM      │  │ 512 MB RAM      │   │   uploads)     │
-  └───────┬────────┘  └───────┬────────┘   └────────────────┘
-          │                    │
+  │ 0.25 vCPU       │  │ 0.25 vCPU       │   │  uploads/      │
+  │ 512 MB RAM      │  │ 512 MB RAM      │   │  chunks/       │
+  └───────┬────────┘  └───────┬────────┘   │  results/      │
+          │                    │             └────────────────┘
           └────────┬───────────┘
                    │
           ┌────────▼────────┐
           │  RDS PostgreSQL  │
-          │  (db.t3.micro)   │
-          └────────┬────────┘
-                   │
-  ┌────────────────┼────────────────┐
-  │                │                │
-  ┌────────▼──────┐ ┌──────▼──────┐ ┌──────▼──────┐
-  │ ECS Worker    │ │ ECS Worker  │ │ ECS Worker  │
-  │ 1 vCPU        │ │ 1 vCPU      │ │ 1 vCPU      │
-  │ 2 GB RAM      │ │ 2 GB RAM    │ │ 2 GB RAM    │
-  │ Fargate Spot  │ │ Fargate Spot│ │ Fargate Spot│
-  └───────────────┘ └─────────────┘ └─────────────┘
+          │  job_records     │
+          │  job_chunks      │
+          └─────────────────┘
 ```
 
 | Component | AWS Service | Details |
 |-----------|-------------|---------|
 | **API** | ECS Fargate | Stateless FastAPI. Streams uploads to S3, reads/writes PostgreSQL. |
-| **Worker** | ECS Fargate Spot | Runs pyannote diarization + Whisper `tiny` + ffmpeg chunking. Spot interruptions handled by PostgreSQL retry logic. |
-| **Database** | RDS PostgreSQL | Job queue (`SELECT … FOR UPDATE SKIP LOCKED`), metadata, artifact storage. |
-| **Object Storage** | S3 | Audio uploads, PDFs, artifact JSON. Presigned POST for direct browser uploads. |
-| **Secrets** | SSM Parameter Store | `DATABASE_URL`, `AWS_S3_BUCKET`, `GEMINI_API_KEY`, `HF_TOKEN`, `CORS_ORIGINS` injected into ECS tasks. |
-| **Container Registry** | ECR | Single image for both API and worker roles. |
+| **Splitter** | ECS Fargate (service) | Polls job queue, splits audio, launches chunk workers. Scales to 0 when idle. |
+| **Chunk worker** | ECS Fargate (RunTask) | Transcribes one job's chunks in a loop. 0.5 vCPU / 2 GB. Exits when done. |
+| **Assembler** | ECS Fargate (RunTask) | Joins transcripts, runs LLM pipeline, generates PDF. 1 vCPU / 4 GB. Exits when done. |
+| **Database** | RDS PostgreSQL | `job_records` job queue + `job_chunks` chunk queue, both using `SELECT … FOR UPDATE SKIP LOCKED`. |
+| **Object Storage** | S3 | Audio uploads (`uploads/`), chunk WAVs (`chunks/`), PDFs + artifacts JSON (`results/`). |
+| **Secrets** | SSM Parameter Store | `DATABASE_URL`, `AWS_S3_BUCKET`, `GEMINI_API_KEY`, `CORS_ORIGINS` injected into ECS tasks. |
+| **Container Registry** | ECR | Single image for API, splitter, chunk worker, and assembler roles. |
 | **Logs** | CloudWatch Logs | Structured JSON logs from `structlog`. 30-day retention. |
 | **Load Balancer** | ALB | TLS termination, health checks (`/health`), HTTP→HTTPS redirect. |
 | **Frontend** | Vercel | Next.js deployed separately. `NEXT_PUBLIC_API_URL` points to the ALB. |
 
-Workers use **Fargate Spot** for up to 70% cost savings. ECS tasks run in public subnets with auto-assigned public IPs (no NAT Gateway). The IAM task role grants S3 access — no static AWS credentials needed in production.
+The IAM task role requires `ecs:RunTask` and `iam:PassRole` (scoped to the worker task definition) in addition to the existing S3 and SSM permissions, so the splitter can launch chunk workers and the assembler.
 
 ---
 
@@ -102,7 +143,7 @@ Execution Tasks carry a `task_source` field (`"Explicit"` or `"Inferred"`) indic
 
 ### Granular Progress States
 
-Jobs transition through 7 stages: `uploading` → `diarizing` → `transcribing` → `extracting` → `generating_pdf` → `completed` / `failed`. Each transition writes status and progress atomically in a single SQL `UPDATE`. The `diarizing` stage is present only when `HF_TOKEN` is configured.
+Jobs transition through these stages: `uploading` → `splitting` → `transcribing` → `assembling` → `extracting` → `generating_pdf` → `completed` / `failed`. Each transition writes status and progress atomically in a single SQL `UPDATE`. The `diarizing` stage is inserted between `uploading` and `splitting` only when `HF_TOKEN` is configured.
 
 During the `extracting` stage the worker receives granular sub-stage callbacks from the intelligence pipeline and writes them to PostgreSQL in real time:
 
@@ -743,6 +784,12 @@ All variables are loaded via Pydantic Settings from environment variables (or `.
 | `RAG_STORAGE_BACKEND` | `memory` | RAG vector storage: `memory` (ephemeral NumPy) or `pgvector` (persistent PostgreSQL) |
 | `COMPRESSION_ENABLED` | `true` | Enable context compression before final extraction |
 | `COMPRESSION_TARGET_BUDGET_TOKENS` | `8000` | Target token budget for compressed context |
+| `ECS_CLUSTER` | `meetolog-cluster` | ECS cluster name |
+| `ECS_WORKER_SERVICE` | `meetolog-worker-svc` | ECS service name for the splitter (scales to 0 when idle) |
+| `ECS_WORKER_TASK_DEFINITION` | `meetolog-worker` | Task definition used when launching chunk workers and assembler via RunTask |
+| `MAX_PARALLEL_CHUNKS` | `6` | Max simultaneous chunk-worker tasks per job (0.5 vCPU × N, default fits within 6 vCPU Fargate limit) |
+| `PARALLEL_MIN_CHUNKS` | `9` | Minimum chunk count to enable parallel transcription. Below this threshold a single chunk worker is used — the ~90 s ECS cold-start overhead exceeds parallelism savings for short meetings. |
+| `WORKER_IDLE_SHUTDOWN_POLLS` | `6` | Consecutive empty polls before the splitter scales itself to 0 (5 s each → 30 s idle window) |
 
 The frontend reads:
 
@@ -754,10 +801,12 @@ The frontend reads:
 
 ## Deployment Constraints
 
-- **PostgreSQL required.** Job lifecycle, persistent queue, file metadata. Production uses AWS RDS. Run `alembic upgrade head` to apply migrations.
-- **AWS S3 required.** Audio, PDFs, and artifact JSON. The ECS task role provides access — no static IAM credentials in production.
-- **Background worker required.** Run as a separate ECS service (`SERVICE_TYPE=worker`) or locally via `python -m app.worker`.
-- **Horizontal scaling.** Workers are stateless. Scale via `aws ecs update-service --desired-count N`. The `SKIP LOCKED` mechanism prevents duplicate processing.
+- **PostgreSQL required.** Job lifecycle, `job_records` queue, `job_chunks` parallel-chunk queue, file metadata. Production uses AWS RDS. Run `alembic upgrade head` to apply all migrations.
+- **AWS S3 required.** Audio uploads (`uploads/`), chunk WAVs (`chunks/`), PDFs and artifact JSON (`results/`). The ECS task role provides access — no static IAM credentials in production.
+- **IAM permissions for RunTask.** The ECS task role (`meetolog-ecs-task-role`) needs `ecs:RunTask` and `iam:PassRole` scoped to the worker task definition. Without these the splitter cannot launch chunk workers; jobs would get stuck in `transcribing`.
+- **Splitter runs as ECS service.** `SERVICE_TYPE=worker` (or `splitter`). Scales to 0 when idle; the API wakes it on job enqueue. Chunk workers and the assembler are ephemeral `RunTask` calls — they are not ECS services.
+- **SKIP LOCKED prevents duplicates.** Both `job_records` and `job_chunks` use `SELECT … FOR UPDATE SKIP LOCKED`. Safe to run multiple splitters or chunk workers simultaneously.
+- **SERVICE_TYPE values.** `web` → FastAPI server. `worker` / `splitter` → splitter polling loop. `chunk_worker` → single-job chunk transcription loop. `assembler` → transcript assembly + extraction + PDF.
 
 ---
 
